@@ -51,9 +51,20 @@ async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName })
   return data.reply ?? null;
 }
 
-export async function startSession({ supabase, supabaseUrl, serviceKey, businessId }) {
-  if (sessions.has(businessId) && sessions.get(businessId).sock) {
-    return sessions.get(businessId);
+export async function startSession({ supabase, supabaseUrl, serviceKey, businessId, phoneNumber }) {
+  const existing = sessions.get(businessId);
+  if (existing && existing.sock) {
+    // Already running — if a phone number was just given and no code exists yet, request one on the live socket.
+    if (phoneNumber && !existing.pairingCode && !existing.sock.authState?.creds?.registered) {
+      try {
+        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+        existing.pairingCode = await existing.sock.requestPairingCode(cleanNumber);
+        existing.pairingRequestedAt = Date.now();
+      } catch (err) {
+        await logError(supabase, businessId, 'requestPairingCode', err);
+      }
+    }
+    return existing;
   }
 
   const { state, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
@@ -67,9 +78,26 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
     browser: ['G Capital AI', 'Chrome', '1.0.0'],
   });
 
-  const entry = { sock, qr: null, status: 'qr_pending' };
+  const entry = { sock, qr: null, pairingCode: null, pairingRequestedAt: null, status: 'connecting' };
   sessions.set(businessId, entry);
-  await setClientStatus(supabase, businessId, 'qr_pending');
+  await setClientStatus(supabase, businessId, 'connecting');
+
+  // PRIMARY METHOD: pairing code — the customer types this code into their own phone
+  // (WhatsApp > Linked Devices > Link with phone number), no second screen/camera needed.
+  // FALLBACK: if no phone number was given, or the pairing code request fails, the
+  // 'qr' event below still fires normally and the dashboard can show the QR instead.
+  if (phoneNumber && !state.creds.registered) {
+    try {
+      const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+      entry.pairingCode = await sock.requestPairingCode(cleanNumber);
+      entry.pairingRequestedAt = Date.now();
+      entry.status = 'pairing_pending';
+      await setClientStatus(supabase, businessId, 'pairing_pending');
+    } catch (err) {
+      await logError(supabase, businessId, 'requestPairingCode', err);
+      // no return — falls through to QR fallback via connection.update below
+    }
+  }
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -78,12 +106,16 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
 
     if (qr) {
       entry.qr = await QRCode.toDataURL(qr);
-      entry.status = 'qr_pending';
-      await setClientStatus(supabase, businessId, 'qr_pending');
+      // Only surface QR-driven status if we're not already mid pairing-code flow.
+      if (entry.status !== 'pairing_pending') {
+        entry.status = 'qr_pending';
+        await setClientStatus(supabase, businessId, 'qr_pending');
+      }
     }
 
     if (connection === 'open') {
       entry.qr = null;
+      entry.pairingCode = null;
       entry.status = 'connected';
       const phone = sock.user?.id?.split(':')[0] || null;
       await setClientStatus(supabase, businessId, 'connected', { phone });
@@ -92,6 +124,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
     if (connection === 'close') {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      entry.pairingCode = null;
 
       if (loggedOut) {
         entry.status = 'disconnected';
