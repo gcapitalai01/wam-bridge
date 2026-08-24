@@ -1,5 +1,4 @@
-import baileys from '@whiskeysockets/baileys';
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import pino from 'pino';
