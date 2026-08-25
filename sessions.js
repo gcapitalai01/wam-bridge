@@ -8,6 +8,7 @@ const logger = pino({ level: 'warn' });
 
 // In-memory registry of live sockets + latest QR per business (single-process, fine for Render free tier)
 const sessions = new Map(); // business_id -> { sock, qr, status }
+const reconnectAttempts = new Map(); // business_id -> consecutive failed-reconnect count, for backoff
 
 async function logError(supabase, businessId, context, error) {
   try {
@@ -139,6 +140,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
       entry.qr = null;
       entry.pairingCode = null;
       entry.status = 'connected';
+      reconnectAttempts.delete(businessId);
       const phone = sock.user?.id?.split(':')[0] || null;
       await setClientStatus(supabase, businessId, 'connected', { phone });
     }
@@ -153,18 +155,23 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
         await setClientStatus(supabase, businessId, 'disconnected');
         await clearAll();
         sessions.delete(businessId);
+        reconnectAttempts.delete(businessId);
         await logError(supabase, businessId, 'connection.close', 'Session logged out — must re-scan QR');
       } else {
-        // Transient drop (network, restart, ban-check, etc.) — try to reconnect.
+        // Transient drop (network blip, Render redeploy, WA server hiccup, etc.) — never give up.
+        // Backs off gradually (4s, 8s, 16s... capped at 60s) so a flaky network doesn't hammer WhatsApp's servers.
         entry.status = 'reconnecting';
         await setClientStatus(supabase, businessId, 'reconnecting');
+        const attempt = (reconnectAttempts.get(businessId) || 0) + 1;
+        reconnectAttempts.set(businessId, attempt);
+        const delay = Math.min(4000 * Math.pow(2, attempt - 1), 60000);
         sessions.delete(businessId);
         await logError(supabase, businessId, 'connection.close', lastDisconnect?.error || 'unknown disconnect');
         setTimeout(() => {
           startSession({ supabase, supabaseUrl, serviceKey, businessId }).catch((e) =>
             logError(supabase, businessId, 'reconnect.failed', e)
           );
-        }, 4000);
+        }, delay).unref?.();
       }
     }
   });
@@ -224,6 +231,30 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
 
 export function getSession(businessId) {
   return sessions.get(businessId) || null;
+}
+
+// Called once on server boot. Sessions live only in memory — if Render restarts/redeploys
+// the process, WhatsApp would otherwise stay silently offline until someone opens the
+// dashboard and clicks reconnect. This finds every business that was connected (or mid-connect)
+// before the restart and resumes them automatically, using their saved Supabase auth state.
+export async function resumeAllSessions({ supabase, supabaseUrl, serviceKey }) {
+  try {
+    const { data: rows, error } = await supabase
+      .from('wam_clients')
+      .select('business_id, status')
+      .in('status', ['connected', 'connecting', 'reconnecting', 'pairing_pending', 'qr_pending']);
+    if (error) throw error;
+    if (!rows?.length) return;
+
+    console.log(`Resuming ${rows.length} WhatsApp session(s) after restart...`);
+    for (const row of rows) {
+      startSession({ supabase, supabaseUrl, serviceKey, businessId: row.business_id }).catch((e) =>
+        logError(supabase, row.business_id, 'resumeAllSessions', e)
+      );
+    }
+  } catch (err) {
+    console.error('resumeAllSessions failed:', err);
+  }
 }
 
 export async function sendTextMessage({ businessId, phone, text }) {
