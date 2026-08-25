@@ -28,6 +28,30 @@ async function setClientStatus(supabase, businessId, status, extra = {}) {
   );
 }
 
+// Baileys' underlying WebSocket needs to actually finish connecting to WhatsApp's
+// servers before requestPairingCode() can succeed — calling it right after
+// makeWASocket() (same tick) throws "Connection Closed". Poll for readyState===1
+// (OPEN) with a sane timeout instead of guessing with a fixed delay.
+function waitForSocketReady(sock, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = setInterval(() => {
+      const ready = sock.ws?.socket?.readyState === 1;
+      if (ready || Date.now() - start > timeoutMs) {
+        clearInterval(check);
+        resolve(ready);
+      }
+    }, 200);
+  });
+}
+
+async function requestPairingCode(supabase, businessId, sock, phoneNumber) {
+  const ready = await waitForSocketReady(sock);
+  if (!ready) throw new Error('WhatsApp socket did not become ready in time');
+  const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+  return sock.requestPairingCode(cleanNumber);
+}
+
 async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName }) {
   const bridgeSecret = process.env.WHATSAPP_BRIDGE_SECRET; // must match the edge function's secret
   const resp = await fetch(`${supabaseUrl}/functions/v1/whatsapp-webhook`, {
@@ -55,10 +79,9 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
   const existing = sessions.get(businessId);
   if (existing && existing.sock) {
     // Already running — if a phone number was just given and no code exists yet, request one on the live socket.
-    if (phoneNumber && !existing.pairingCode && !existing.sock.authState?.creds?.registered) {
+    if (phoneNumber && !existing.sock.authState?.creds?.registered) {
       try {
-        const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-        existing.pairingCode = await existing.sock.requestPairingCode(cleanNumber);
+        existing.pairingCode = await requestPairingCode(supabase, businessId, existing.sock, phoneNumber);
         existing.pairingRequestedAt = Date.now();
       } catch (err) {
         await logError(supabase, businessId, 'requestPairingCode', err);
@@ -88,8 +111,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
   // 'qr' event below still fires normally and the dashboard can show the QR instead.
   if (phoneNumber && !state.creds.registered) {
     try {
-      const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-      entry.pairingCode = await sock.requestPairingCode(cleanNumber);
+      entry.pairingCode = await requestPairingCode(supabase, businessId, sock, phoneNumber);
       entry.pairingRequestedAt = Date.now();
       entry.status = 'pairing_pending';
       await setClientStatus(supabase, businessId, 'pairing_pending');
@@ -202,6 +224,15 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
 
 export function getSession(businessId) {
   return sessions.get(businessId) || null;
+}
+
+export async function sendTextMessage({ businessId, phone, text }) {
+  const entry = sessions.get(businessId);
+  if (!entry?.sock) throw new Error('No active WhatsApp session for this business.');
+  if (entry.status !== 'connected') throw new Error(`WhatsApp session is not connected (status: ${entry.status}).`);
+  const jid = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+  const result = await entry.sock.sendMessage(jid, { text });
+  return { externalMessageId: result?.key?.id || null };
 }
 
 export async function stopSession({ supabase, businessId }) {
