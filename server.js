@@ -1,6 +1,6 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { startSession, getSession, stopSession } from './sessions.js';
+import { startSession, getSession, stopSession, sendTextMessage, resumeAllSessions } from './sessions.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -82,13 +82,32 @@ app.get('/session/:businessId/qr', requireAuth, (req, res) => {
   res.json({ status: entry.status, qr: entry.qr }); // data URL, dashboard can render directly in <img src=...>
 });
 
-app.get('/session/:businessId/status', requireAuth, (req, res) => {
-  const entry = getSession(req.params.businessId);
-  res.json({
-    status: entry?.status || 'not_started',
-    pairingCode: entry?.pairingCode || null,
-    hasQr: !!entry?.qr,
-  });
+app.get('/session/:businessId/status', requireAuth, async (req, res) => {
+  const { businessId } = req.params;
+  const entry = getSession(businessId);
+  if (entry) {
+    return res.json({ status: entry.status, pairingCode: entry.pairingCode || null, hasQr: !!entry.qr });
+  }
+  // No live in-memory session (e.g. right after a restart, before auto-resume kicks in) —
+  // fall back to the last known state so the dashboard doesn't flash "not connected" for nothing.
+  try {
+    const { data } = await supabase.from('wam_clients').select('status, phone').eq('business_id', businessId).maybeSingle();
+    res.json({ status: data?.status || 'not_started', pairingCode: null, hasQr: false, phone: data?.phone || null });
+  } catch (err) {
+    res.json({ status: 'not_started', pairingCode: null, hasQr: false });
+  }
+});
+
+app.post('/session/:businessId/send', requireAuth, async (req, res) => {
+  const { businessId } = req.params;
+  const { phone, text } = req.body || {};
+  if (!phone || !text) return res.status(400).json({ error: 'phone and text are required' });
+  try {
+    const result = await sendTextMessage({ businessId, phone, text });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
 });
 
 app.post('/session/:businessId/stop', requireAuth, async (req, res) => {
@@ -101,4 +120,7 @@ app.post('/session/:businessId/stop', requireAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WhatsApp QR bridge listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`WhatsApp QR bridge listening on :${PORT}`);
+  resumeAllSessions({ supabase, supabaseUrl: SUPABASE_URL, serviceKey: SUPABASE_SERVICE_ROLE_KEY });
+});
