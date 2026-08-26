@@ -1,4 +1,4 @@
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, fetchLatestWaWebVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -53,7 +53,7 @@ async function requestPairingCode(supabase, businessId, sock, phoneNumber) {
   return sock.requestPairingCode(cleanNumber);
 }
 
-async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName }) {
+async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName, mediaUrl, mediaType }) {
   const bridgeSecret = process.env.WHATSAPP_BRIDGE_SECRET; // must match the edge function's secret
   const resp = await fetch(`${supabaseUrl}/functions/v1/whatsapp-webhook`, {
     method: 'POST',
@@ -66,6 +66,8 @@ async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName })
       phone: from,
       message: text,
       push_name: pushName || null,
+      media_url: mediaUrl || null,
+      media_type: mediaType || null, // 'image' | 'audio' | 'document'
     }),
   });
   if (!resp.ok) {
@@ -74,6 +76,28 @@ async function forwardToBrain({ supabaseUrl, businessId, from, text, pushName })
   }
   const data = await resp.json();
   return data.reply ?? null;
+}
+
+// Detects which kind of media (if any) is in an inbound message, downloads the raw bytes
+// straight from WhatsApp's CDN, and uploads them to Supabase Storage — never to Render's
+// disk, which is ephemeral and gets wiped on every deploy/restart anyway.
+async function uploadInboundMedia(supabase, sock, msg, businessId) {
+  const m = msg.message;
+  const kind = m.imageMessage ? 'image' : m.audioMessage ? 'audio' : (m.documentMessage || m.documentWithCaptionMessage) ? 'document' : null;
+  if (!kind) return null;
+
+  const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+  const mediaMsg = m.imageMessage || m.audioMessage || m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage;
+  const mimetype = mediaMsg?.mimetype || 'application/octet-stream';
+  const extFromMime = mimetype.split('/')[1]?.split(';')[0] || 'bin';
+  const originalName = mediaMsg?.fileName;
+  const ext = originalName?.match(/\.[a-zA-Z0-9]+$/)?.[0] || `.${extFromMime}`;
+  const path = `${businessId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+
+  const { error } = await supabase.storage.from('whatsapp-inbound').upload(path, buffer, { contentType: mimetype });
+  if (error) throw error;
+  const { data: urlData } = supabase.storage.from('whatsapp-inbound').getPublicUrl(path);
+  return { url: urlData.publicUrl, type: kind, mimetype };
 }
 
 export async function startSession({ supabase, supabaseUrl, serviceKey, businessId, phoneNumber }) {
@@ -92,7 +116,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
   }
 
   const { state, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchLatestWaWebVersion({});
 
   const sock = makeWASocket({
     version,
@@ -130,7 +154,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
     if (qr) {
       entry.qr = await QRCode.toDataURL(qr);
       // Only surface QR-driven status if we're not already mid pairing-code flow.
-      if (entry.status !== 'pairing_pending') {
+      if (entry.status !== 'pairing_pending' && !entry.pairingCode) {
         entry.status = 'qr_pending';
         await setClientStatus(supabase, businessId, 'qr_pending');
       }
@@ -189,8 +213,17 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
           msg.message.imageMessage?.caption ||
+          msg.message.documentMessage?.caption ||
           null;
-        if (!text) continue; // non-text media: log only, no auto-reply for now
+
+        let media = null;
+        try {
+          media = await uploadInboundMedia(supabase, sock, msg, businessId);
+        } catch (mediaErr) {
+          await logError(supabase, businessId, 'uploadInboundMedia', mediaErr);
+        }
+
+        if (!text && !media) continue; // nothing usable (e.g. a reaction, a status update, etc.)
 
         const phoneNumber = from.split('@')[0];
 
@@ -199,6 +232,8 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
           direction: 'in',
           phone: phoneNumber,
           text,
+          media_url: media?.url || null,
+          media_type: media?.type || null,
           created_at: new Date().toISOString(),
         });
 
@@ -208,6 +243,8 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
           from: phoneNumber,
           text,
           pushName: msg.pushName,
+          mediaUrl: media?.url || null,
+          mediaType: media?.type || null,
         });
 
         if (reply) {
@@ -263,6 +300,27 @@ export async function sendTextMessage({ businessId, phone, text }) {
   if (entry.status !== 'connected') throw new Error(`WhatsApp session is not connected (status: ${entry.status}).`);
   const jid = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
   const result = await entry.sock.sendMessage(jid, { text });
+  return { externalMessageId: result?.key?.id || null };
+}
+
+// Used by the AI's send_catalog_item tool — sends a business's product photo, price-list
+// PDF, or voice note (whatever's saved in business_assets) straight from its Supabase URL.
+export async function sendMediaMessage({ businessId, phone, url, mimetype, caption, fileName }) {
+  const entry = sessions.get(businessId);
+  if (!entry?.sock) throw new Error('No active WhatsApp session for this business.');
+  if (entry.status !== 'connected') throw new Error(`WhatsApp session is not connected (status: ${entry.status}).`);
+  const jid = phone.includes('@') ? phone : `${phone.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+
+  let content;
+  if (mimetype?.startsWith('image/')) {
+    content = { image: { url }, caption: caption || undefined };
+  } else if (mimetype?.startsWith('audio/')) {
+    content = { audio: { url }, mimetype, ptt: false };
+  } else {
+    content = { document: { url }, mimetype: mimetype || 'application/pdf', fileName: fileName || 'catalogo.pdf', caption: caption || undefined };
+  }
+
+  const result = await entry.sock.sendMessage(jid, content);
   return { externalMessageId: result?.key?.id || null };
 }
 
