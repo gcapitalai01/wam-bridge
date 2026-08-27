@@ -1,6 +1,6 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { startSession, getSession, stopSession, sendTextMessage, resumeAllSessions } from './sessions.js';
+import { startSession, getSession, stopSession, sendTextMessage, sendMediaMessage, resumeAllSessions } from './sessions.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -104,6 +104,24 @@ app.post('/session/:businessId/send', requireAuth, async (req, res) => {
   if (!phone || !text) return res.status(400).json({ error: 'phone and text are required' });
   try {
     const result = await sendTextMessage({ businessId, phone, text });
+    if (result.externalMessageId) {
+      await supabase.from('bot_sent_messages').insert({ business_id: businessId, channel: 'whatsapp', external_id: result.externalMessageId });
+    }
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+app.post('/session/:businessId/send-media', requireAuth, async (req, res) => {
+  const { businessId } = req.params;
+  const { phone, url, mimetype, caption, fileName } = req.body || {};
+  if (!phone || !url) return res.status(400).json({ error: 'phone and url are required' });
+  try {
+    const result = await sendMediaMessage({ businessId, phone, url, mimetype, caption, fileName });
+    if (result.externalMessageId) {
+      await supabase.from('bot_sent_messages').insert({ business_id: businessId, channel: 'whatsapp', external_id: result.externalMessageId });
+    }
     res.json({ ok: true, ...result });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
