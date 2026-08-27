@@ -205,9 +205,20 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
 
     for (const msg of messages) {
       try {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg.message) continue;
         const from = msg.key.remoteJid;
-        if (!from || from.endsWith('@g.us') || from === 'status@broadcast') continue; // ignore groups/status
+        if (!from || from.endsWith('@g.us') || from === 'status@broadcast') continue;
+
+        // Owner typed directly on their phone (not via our bot) -> pause AI on this thread.
+        if (msg.key.fromMe) {
+          const msgId = msg.key.id;
+          const { data: botSent } = await supabase.from('bot_sent_messages').select('id').eq('business_id', businessId).eq('channel', 'whatsapp').eq('external_id', msgId).maybeSingle();
+          if (!botSent) {
+            const phoneNumber = from.split('@')[0];
+            await supabase.from('conversations').update({ human_takeover_at: new Date().toISOString() }).eq('business_id', businessId).eq('channel', 'whatsapp').eq('external_id', phoneNumber);
+          }
+          continue;
+        }
 
         const text =
           msg.message.conversation ||
@@ -248,7 +259,10 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
         });
 
         if (reply) {
-          await sock.sendMessage(from, { text: reply });
+          const sendResult = await sock.sendMessage(from, { text: reply });
+          if (sendResult?.key?.id) {
+            await supabase.from('bot_sent_messages').insert({ business_id: businessId, channel: 'whatsapp', external_id: sendResult.key.id });
+          }
           await supabase.from('wam_messages').insert({
             business_id: businessId,
             direction: 'out',
