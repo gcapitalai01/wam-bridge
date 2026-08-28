@@ -124,6 +124,7 @@ export async function startSession({ supabase, supabaseUrl, serviceKey, business
     logger,
     printQRInTerminal: false,
     browser: ['G Capital AI', 'Chrome', '1.0.0'],
+    markOnlineOnConnect: false, // keeps phone acting "primary" so notification sounds aren't suppressed
   });
 
   const entry = { sock, qr: null, pairingCode: null, pairingRequestedAt: null, status: 'connecting' };
