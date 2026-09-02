@@ -1,18 +1,19 @@
 {
-  "name": "gcapitalai-whatsapp-bridge",
-  "version": "1.0.0",
+  "name": "gcapitalai-wa-bridge",
+  "version": "3.0.0",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": { "node": ">=20" },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",
-    "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.45.4",
     "express": "^4.19.2",
-    "qrcode": "^1.5.4",
-    "pino": "^9.4.0"
+    "qrcode": "^1.5.3",
+    "pino": "^9.3.2"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
