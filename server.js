@@ -26,18 +26,15 @@
 // ============================================================
 
 import express from "express";
-import baileysPkg from "@whiskeysockets/baileys";
-import { createClient } from "@supabase/supabase-js";
-import QRCode from "qrcode";
-import pino from "pino";
-
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
-} = baileysPkg;
+} from "@whiskeysockets/baileys";
+import { createClient } from "@supabase/supabase-js";
+import QRCode from "qrcode";
+import pino from "pino";
 
 // ---------- Config (variables de entorno en Render) ----------
 const PORT = process.env.PORT || 3000;
