@@ -377,7 +377,11 @@ app.post("/session/:businessId/stop", requireBridgeKey, async (req, res) => {
     state.sock = null;
     state.status = "disconnected";
     await updateWamClientStatus(businessId, "disconnected", state.phone);
-    await supabase.from("whatsapp_sessions").delete().eq("business_id", businessId).catch(() => {});
+    try {
+      await supabase.from("whatsapp_sessions").delete().eq("business_id", businessId);
+    } catch (err) {
+      logger.error({ err }, "No se pudo borrar whatsapp_sessions en /stop (no bloqueante)");
+    }
     res.json({ ok: true });
   }
 });
