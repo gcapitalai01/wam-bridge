@@ -27,15 +27,15 @@
 
 import express from "express";
 import makeWASocket, {
-  useMultiFileAuthState,
   DisconnectReason,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
+  initAuthCreds,
+  BufferJSON,
 } from "@whiskeysockets/baileys";
 import { createClient } from "@supabase/supabase-js";
 import QRCode from "qrcode";
 import pino from "pino";
-import fs from "fs/promises";
 
 // ---------- Config (variables de entorno en Render) ----------
 const PORT = process.env.PORT || 3000;
@@ -74,10 +74,69 @@ function jidToPhone(jid) {
   return (jid || "").split("@")[0].split(":")[0];
 }
 
-// ---------- Sesión de WhatsApp en DISCO PERSISTENTE de Render (montado en /data) ----------
-// Se usa el método nativo y probado de Baileys. Requiere un disco persistente en Render
-// (Dashboard → este servicio → Disks → Add Disk → mount path /data) para sobrevivir reinicios.
-const SESSION_ROOT = process.env.SESSION_DIR || "/data/sessions";
+// ---------- Sesión de WhatsApp persistida en SUPABASE (no requiere disco de Render) ----------
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+async function useSupabaseAuthState(businessId) {
+  const { data: row } = await supabase.from("whatsapp_sessions").select("data").eq("business_id", businessId).maybeSingle();
+
+  let creds;
+  let keysData = {};
+  if (row?.data) {
+    const parsed = JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
+    creds = parsed.creds;
+    keysData = parsed.keys || {};
+  } else {
+    creds = initAuthCreds();
+  }
+
+  const persist = debounce(async () => {
+    try {
+      const payload = JSON.parse(JSON.stringify({ creds, keys: keysData }, BufferJSON.replacer));
+      await supabase.from("whatsapp_sessions").upsert(
+        { business_id: businessId, data: payload, updated_at: new Date().toISOString() },
+        { onConflict: "business_id" }
+      );
+    } catch (err) {
+      logger.error({ err }, "No se pudo guardar la sesión de WhatsApp en Supabase");
+    }
+  }, 1500);
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const result = {};
+          for (const id of ids) {
+            result[id] = keysData[type]?.[id];
+          }
+          return result;
+        },
+        set: async (data) => {
+          for (const type in data) {
+            keysData[type] = keysData[type] || {};
+            for (const id in data[type]) {
+              if (data[type][id] == null) delete keysData[type][id];
+              else keysData[type][id] = data[type][id];
+            }
+          }
+          persist();
+        },
+      },
+    },
+    saveCreds: async () => persist(),
+    clearSession: async () => {
+      await supabase.from("whatsapp_sessions").delete().eq("business_id", businessId);
+    },
+  };
+}
 async function updateWamClientStatus(businessId, status, phone) {
   try {
     await supabase.from("wam_clients").upsert(
@@ -145,7 +204,7 @@ async function startSession(businessId, phoneNumberForPairing) {
   if (state.connecting) return state;
   state.connecting = true;
 
-  const { state: authState, saveCreds } = await useMultiFileAuthState(`${SESSION_ROOT}/${businessId}`);
+  const { state: authState, saveCreds, clearSession } = await useSupabaseAuthState(businessId);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -197,7 +256,7 @@ async function startSession(businessId, phoneNumberForPairing) {
       if (loggedOut) {
         state.status = "disconnected";
         await updateWamClientStatus(businessId, "disconnected", state.phone);
-        try { await fs.rm(`${SESSION_ROOT}/${businessId}`, { recursive: true, force: true }); } catch (_) {}
+        await clearSession().catch(() => {});
         logger.warn(`[${businessId}] Sesión cerrada por WhatsApp — se borró la sesión guardada. Hay que volver a emparejar desde el dashboard (nuevo QR/código).`);
       } else {
         state.status = "reconnecting";
@@ -206,6 +265,22 @@ async function startSession(businessId, phoneNumberForPairing) {
       }
     }
   });
+
+// ---------- Cola de procesamiento por contacto (arregla la corrupción de cifrado) ----------
+// CAUSA RAÍZ REAL encontrada (5 sep 2026): si un cliente manda 2+ mensajes seguidos rápido
+// (ej. "Hola" y luego "Buenas tardes" en pocos segundos), Baileys dispara messages.upsert
+// dos veces, y como el manejador anterior no había terminado (seguía esperando la respuesta
+// de la IA), AMBOS terminaban enviando al mismo tiempo — dos operaciones de cifrado tocando
+// la MISMA sesión Signal en paralelo. Eso es exactamente lo que corrompía la sesión ("Bad
+// MAC", "Closing session" con dos registrationId distintos). Esta cola obliga a procesar los
+// mensajes de un mismo contacto de UNO EN UNO, nunca en paralelo.
+const jidQueues = new Map();
+function enqueuePerJid(jid, task) {
+  const prev = jidQueues.get(jid) || Promise.resolve();
+  const next = prev.then(task, task).catch((err) => logger.error({ err }, "Error en la cola de mensajes"));
+  jidQueues.set(jid, next);
+  return next;
+}
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
@@ -223,41 +298,43 @@ async function startSession(businessId, phoneNumberForPairing) {
         continue; // no reenviar los propios mensajes del dueño como si fueran del cliente
       }
 
-      const { text, mediaType } = extractMessageContent(msg);
-      const pushName = msg.pushName || null;
+      enqueuePerJid(jid, async () => {
+        const { text, mediaType } = extractMessageContent(msg);
+        const pushName = msg.pushName || null;
 
-      let mediaUrl = null;
-      if (mediaType) {
-        try {
-          const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger });
-          const extMap = { image: "jpg", audio: "ogg", document: "pdf" };
-          const contentTypeMap = { image: "image/jpeg", audio: "audio/ogg", document: "application/octet-stream" };
-          mediaUrl = await uploadMediaToSupabase(businessId, buffer, extMap[mediaType] || "bin", contentTypeMap[mediaType]);
-        } catch (err) {
-          logger.error({ err }, "No se pudo descargar/subir el archivo multimedia entrante");
+        let mediaUrl = null;
+        if (mediaType) {
+          try {
+            const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger });
+            const extMap = { image: "jpg", audio: "ogg", document: "pdf" };
+            const contentTypeMap = { image: "image/jpeg", audio: "audio/ogg", document: "application/octet-stream" };
+            mediaUrl = await uploadMediaToSupabase(businessId, buffer, extMap[mediaType] || "bin", contentTypeMap[mediaType]);
+          } catch (err) {
+            logger.error({ err }, "No se pudo descargar/subir el archivo multimedia entrante");
+          }
         }
-      }
 
-      const aiResult = await forwardIncomingToAI(businessId, {
-        business_id: businessId,
-        phone,
-        message: text,
-        push_name: pushName,
-        media_url: mediaUrl,
-        media_type: mediaType,
+        const aiResult = await forwardIncomingToAI(businessId, {
+          business_id: businessId,
+          phone,
+          message: text,
+          push_name: pushName,
+          media_url: mediaUrl,
+          media_type: mediaType,
+        });
+
+        if (aiResult?.reply) {
+          try {
+            await sock.presenceSubscribe(jid).catch(() => {});
+            await sock.sendPresenceUpdate("composing", jid);
+            await new Promise((r) => setTimeout(r, 1200));
+            await sock.sendMessage(jid, { text: aiResult.reply });
+            await sock.sendPresenceUpdate("paused", jid);
+          } catch (err) {
+            logger.error({ err }, "No se pudo enviar la respuesta de la IA");
+          }
+        }
       });
-
-      if (aiResult?.reply) {
-        try {
-          await sock.presenceSubscribe(jid).catch(() => {});
-          await sock.sendPresenceUpdate("composing", jid);
-          await new Promise((r) => setTimeout(r, 1200));
-          await sock.sendMessage(jid, { text: aiResult.reply });
-          await sock.sendPresenceUpdate("paused", jid);
-        } catch (err) {
-          logger.error({ err }, "No se pudo enviar la respuesta de la IA");
-        }
-      }
     }
   });
 
@@ -312,9 +389,9 @@ app.post("/session/:businessId/stop", requireBridgeKey, async (req, res) => {
     state.status = "disconnected";
     await updateWamClientStatus(businessId, "disconnected", state.phone);
     try {
-      await fs.rm(`${SESSION_ROOT}/${businessId}`, { recursive: true, force: true });
+      await supabase.from("whatsapp_sessions").delete().eq("business_id", businessId);
     } catch (err) {
-      logger.error({ err }, "No se pudo borrar la carpeta de sesión en /stop (no bloqueante)");
+      logger.error({ err }, "No se pudo borrar whatsapp_sessions en /stop (no bloqueante)");
     }
     res.json({ ok: true });
   }
