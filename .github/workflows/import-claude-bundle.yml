@@ -1,0 +1,49 @@
+name: Import Claude Bridge Bundle
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".bridge-upload/**"
+      - ".github/workflows/import-claude-bundle.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import validated Claude bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "G Capital AI Bridge Import"
+          git config user.email "bridge-import@gcapitalai.local"
+
+          git fetch .bridge-upload/claude.bundle refs/heads/main:refs/remotes/claude/import
+
+          test "$(git rev-parse refs/remotes/claude/import)" = "1288a2a1a597359687bea070916878120527bf6c"
+          test "$(git rev-parse refs/remotes/claude/import^)" = "5ac8ad6b1f01439d92f148486b46966275b8f31c"
+
+          git cherry-pick 1288a2a1a597359687bea070916878120527bf6c
+
+          git apply --check .bridge-upload/qa.patch
+          git apply .bridge-upload/qa.patch
+          git add -A
+          git commit -m "QA fixes: align Supabase settings, enforce WhatsApp access, fix persistence constraints"
+
+          npm install --ignore-scripts --no-audit --no-fund
+          npm test
+          rm -f package-lock.json
+
+          git rm .bridge-upload/claude.bundle .bridge-upload/qa.patch .github/workflows/import-claude-bundle.yml
+          git commit -m "Remove temporary bridge import artifacts"
+
+          git push origin HEAD:main
