@@ -35,7 +35,14 @@ export function createSessionManager({ supabase, logger, onMessages, onClientSta
 
     const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
     const { version } = await fetchLatestBaileysVersion();
-    const sock = makeWASocket({ version, auth: authState, logger, printQRInTerminal: false, browser: ["G Capital AI", "Chrome", "1.0"], markOnlineOnConnect: false });
+    const sock = makeWASocket({
+      version, auth: authState, logger, printQRInTerminal: false,
+      browser: ["G Capital AI", "Chrome", "1.0"], markOnlineOnConnect: false,
+      // Never replay old history into the live message pipeline — an old
+      // fromMe message from history sync must never look like a fresh
+      // human-manual message and trigger the 30-minute mute.
+      shouldSyncHistoryMessage: () => false,
+    });
     st.sock = sock;
     st.status = "connecting";
 

@@ -97,12 +97,27 @@ export function createState(supabase, log = console) {
       return !!(await rpc("wa_can_send", { ...k(key), p_processing_version: processingVersion }));
     },
 
+    // UPSERT (not UPDATE): the first business message for a brand-new chat has
+    // no wa_chat_state row yet, so a plain UPDATE would silently affect zero
+    // rows and the session language would never be stored.
     async persistLanguage(key, { language, confidence, source }) {
-      const { error } = await supabase.from("wa_chat_state").update({
+      const { error } = await supabase.from("wa_chat_state").upsert({
+        business_id: key.businessId, connection_id: key.connectionId, chat_jid: key.chatJid,
         detected_language: language, language_confidence: confidence, language_source: source,
         language_updated_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-      }).eq("business_id", key.businessId).eq("connection_id", key.connectionId).eq("chat_jid", key.chatJid);
+      }, { onConflict: "business_id,connection_id,chat_jid" });
       if (error) log.warn?.({ error }, "persistLanguage failed (non-blocking)");
+    },
+
+    // Clears processing_started_at once a claimed batch finishes/cancels/fails,
+    // guarded by processing_version so a stale clear can never clobber a newer
+    // claim that has already moved the version forward.
+    async clearProcessing(key, processingVersion) {
+      const { error } = await supabase.from("wa_chat_state").update({
+        processing_started_at: null, updated_at: new Date().toISOString(),
+      }).eq("business_id", key.businessId).eq("connection_id", key.connectionId).eq("chat_jid", key.chatJid)
+        .eq("processing_version", processingVersion);
+      if (error) log.warn?.({ error }, "clearProcessing failed (non-blocking)");
     },
 
     async dueBatches(limit = 50) {

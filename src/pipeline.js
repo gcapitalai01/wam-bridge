@@ -14,7 +14,7 @@ const HUMAN_FROM_ME_MAX_AGE_MS = 2 * 60 * 1000;
 const TEXTLESS_MEDIA = new Set(["audio", "image", "video", "document", "sticker"]);
 const keyStr = (k) => `${k.businessId}|${k.connectionId}|${k.chatJid}`;
 
-export function createPipeline({ state, ai, send, log = console, now = () => Date.now(), onHumanMessage }) {
+export function createPipeline({ state, ai, send, log = console, now = () => Date.now(), onHumanMessage, checkAccess }) {
   const timers = new Map();
   const inflight = new Map();
   const seen = new Set(); // best-effort in-process idempotency, on top of the wam_messages check
@@ -52,35 +52,54 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     const batch = await state.claimBatch(key, debounceVersion);   // 11: re-read state before AI
     if (!batch?.items?.length) return { status: "SKIPPED" };      // 12: state no longer valid -> stop
 
-    const last = batch.items[batch.items.length - 1];
-    const language = last.language || "en";
-    const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
-
-    const ks = keyStr(key);
-    const ac = new AbortController();
-    inflight.set(ks, ac);
-    let reply;
     try {
-      reply = await ai({ key, items: batch.items, text, language, signal: ac.signal });
-    } catch (e) {
-      if (ac.signal.aborted) return { status: "CANCELLED" };
-      throw e;
-    } finally {
-      if (inflight.get(ks) === ac) inflight.delete(ks);
-    }
-    if (ac.signal.aborted || !reply) return { status: reply ? "CANCELLED" : "NO_REPLY" };
+      // Paid/admin access is enforced here too, not just at connect time — a
+      // subscription can lapse mid-conversation. Blocked silently: no AI call,
+      // no reply, no logout/session teardown (that's the Bridge's job, not ours).
+      if (checkAccess) {
+        const access = await checkAccess(key.businessId);
+        if (!access?.allowed) return { status: "ACCESS_BLOCKED", reason: access?.reason };
+      }
 
-    if (!(await state.canSend(key, batch.processingVersion))) return { status: "CANCELLED" }; // 13: re-read before send
-    const id = await sendRegistered(key, reply);                                              // 14+15
-    await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: id, text: reply, isBusinessContext: true, detectedLanguage: language, languageSource: "session" });
-    return { status: "SENT", messageId: id };
+      const last = batch.items[batch.items.length - 1];
+      const pushName = last.pushName || null;
+      const language = last.language || "en";
+      const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
+
+      const ks = keyStr(key);
+      const ac = new AbortController();
+      inflight.set(ks, ac);
+      let reply;
+      try {
+        reply = await ai({ key, items: batch.items, text, language, pushName, signal: ac.signal });
+      } catch (e) {
+        if (ac.signal.aborted) return { status: "CANCELLED" };
+        throw e;
+      } finally {
+        if (inflight.get(ks) === ac) inflight.delete(ks);
+      }
+      if (ac.signal.aborted || !reply) return { status: reply ? "CANCELLED" : "NO_REPLY" };
+
+      if (!(await state.canSend(key, batch.processingVersion))) return { status: "CANCELLED" }; // 13: re-read before send
+      const id = await sendRegistered(key, reply);                                              // 14+15
+      await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: id, text: reply, isBusinessContext: true, detectedLanguage: language, languageSource: "session" });
+      return { status: "SENT", messageId: id };
+    } finally {
+      // Always clear the in-progress marker once this claimed batch is done,
+      // whatever the outcome — guarded by processingVersion so it can never
+      // clobber a newer claim.
+      if (state.clearProcessing) await state.clearProcessing(key, batch.processingVersion).catch(() => {});
+    }
   }
 
   async function handle(raw, { businessId, connectionId, upsertType = "notify" }) {
     // 1. receive
     const norm = extractMessage(raw);
     if (!norm || isIgnorableJid(norm.chatJid)) return { classification: "IGNORED" };
-    if (upsertType !== "notify" && !norm.fromMe) return { classification: "HISTORY" };
+    // History-sync upserts (non-"notify") are ALWAYS ignored, fromMe or not —
+    // an old fromMe message replayed from history must never trigger the
+    // 30-minute human mute.
+    if (upsertType !== "notify") return { classification: "HISTORY" };
     const key = { businessId, connectionId, chatJid: norm.chatJid };
 
     // 2. idempotency
@@ -107,6 +126,13 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     // 5. normalize is done (norm); load chat state + settings + quoted context
     const chatState = await state.getChatState(key);
     const settings = await state.getSettings(businessId);
+
+    // 9. Automation switched off for this tenant -> stop before AI/debounce,
+    // full stop (no gate evaluation, no session update, no reply).
+    if (settings.enabled === false) {
+      return { classification: "CUSTOMER", decision: { allowed: false, reason: "AUTOMATION_DISABLED" } };
+    }
+
     const isMuted = !!chatState?.muted_until && new Date(chatState.muted_until).getTime() > now();
 
     let quotedContext = null;
@@ -152,7 +178,7 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     if (!gate.allowed) return { classification: "CUSTOMER", decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id } };
 
     // 9 + 10. update business-session state and start/reset the 4s debounce (one atomic call).
-    const item = { id: norm.id, type: norm.messageType, text: norm.text, language: lang.language, reason: gate.reason };
+    const item = { id: norm.id, type: norm.messageType, text: norm.text, language: lang.language, reason: gate.reason, pushName: norm.pushName || null };
     const q = await state.enqueue(key, item, {
       activate: gate.activateSession, reason: gate.reason,
       ttlSeconds: settings.business_session_ttl_seconds, debounceMs: settings.debounce_seconds * 1000,

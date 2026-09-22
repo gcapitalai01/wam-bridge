@@ -10,7 +10,7 @@ import { createSessionManager } from "./src/sessionManager.js";
 import { createState } from "./src/state.js";
 import { createPipeline } from "./src/pipeline.js";
 import { isIgnorableJid } from "./src/messageUtils.js";
-import { createWhatsAppAccessControl } from "./src/accessControl.js";
+import { createWhatsAppAccessControl, createCachedAccessCheck } from "./src/accessControl.js";
 
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://wkpvlgfirechfeppfutg.supabase.co";
@@ -21,12 +21,22 @@ const WHATSAPP_BRIDGE_SECRET = process.env.WHATSAPP_BRIDGE_SECRET || "";
 const BRIDGE_KEY = process.env.BRIDGE_API_KEY || "";
 const BRIDGE_KEY_OK = BRIDGE_KEY.length >= 24;
 
-if (!SUPABASE_SERVICE_ROLE_KEY) console.error("Missing SUPABASE_SERVICE_ROLE_KEY.");
-if (!BRIDGE_KEY_OK) console.error("BRIDGE_API_KEY missing or shorter than 24 chars — protected routes disabled.");
+// Fail startup outright on any missing/invalid required secret — never boot
+// into a state where protected routes are silently disabled at runtime.
+const startupErrors = [];
+if (!SUPABASE_SERVICE_ROLE_KEY) startupErrors.push("Missing SUPABASE_SERVICE_ROLE_KEY.");
+if (!WHATSAPP_BRIDGE_SECRET) startupErrors.push("Missing WHATSAPP_BRIDGE_SECRET.");
+if (!BRIDGE_KEY_OK) startupErrors.push("Missing or invalid BRIDGE_API_KEY (must be >=24 chars).");
+if (startupErrors.length) {
+  for (const msg of startupErrors) console.error(msg);
+  console.error("Refusing to start with missing/invalid required environment variables.");
+  process.exit(1);
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 const checkWhatsAppAccess = createWhatsAppAccessControl(supabase, logger);
+const checkWhatsAppAccessCached = createCachedAccessCheck(checkWhatsAppAccess, 60000);
 const jidToPhone = (jid) => (jid || "").split("@")[0].split(":")[0];
 
 async function pingHumanTakeover(businessId, phone) {
@@ -46,15 +56,15 @@ const state = createState(supabase, logger);
 let sessionManager;
 
 const pipeline = createPipeline({
-  state, log: logger,
-  ai: async ({ key, items, text, language, signal }) => {
+  state, log: logger, checkAccess: checkWhatsAppAccessCached,
+  ai: async ({ key, items, text, language, pushName, signal }) => {
     const last = items[items.length - 1] || {};
     // Step 14: the reply-language instruction travels with the request; the AI must reply in it.
     const data = await forwardIncomingToAI({
       business_id: key.businessId, connection_id: key.connectionId, chat_jid: key.chatJid,
       phone: jidToPhone(key.chatJid), message: text,
       messages: items.map((i) => ({ id: i.id, type: i.type, text: i.text, reason: i.reason })),
-      push_name: last.pushName || null, activation_reason: last.reason || null,
+      push_name: pushName || last.pushName || null, activation_reason: last.reason || null,
       reply_language: language,
       media_url: null, media_type: null, // raw media never reaches the main AI
     }, signal);
@@ -158,6 +168,8 @@ app.post("/session/:businessId/stop", requireBridgeKey, async (req, res) => {
 app.post("/session/:businessId/send", requireBridgeKey, async (req, res) => {
   const { phone, text } = req.body || {};
   if (!phone || !text) return res.status(400).json({ error: "phone and text are required" });
+  const access = await checkWhatsAppAccessCached(req.params.businessId);
+  if (!access?.allowed) return res.status(403).json({ error: access?.reason || "PAID_PLAN_REQUIRED" });
   try { res.json({ ok: true, messageId: await sendViaBridge(req.params.businessId, phone, { text }) }); }
   catch (err) { logger.error({ err }, "send failed"); res.status(409).json({ error: err.message }); }
 });
@@ -165,6 +177,8 @@ app.post("/session/:businessId/send", requireBridgeKey, async (req, res) => {
 app.post("/session/:businessId/send-media", requireBridgeKey, async (req, res) => {
   const { phone, url, mimetype, caption, fileName } = req.body || {};
   if (!phone || !url) return res.status(400).json({ error: "phone and url are required" });
+  const access = await checkWhatsAppAccessCached(req.params.businessId);
+  if (!access?.allowed) return res.status(403).json({ error: access?.reason || "PAID_PLAN_REQUIRED" });
   const isImage = (mimetype || "").startsWith("image/");
   const isAudio = (mimetype || "").startsWith("audio/");
   const payload = isImage ? { image: { url }, caption: caption || undefined }
