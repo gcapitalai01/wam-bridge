@@ -44,7 +44,7 @@ export function createState(supabase, log = console) {
         phone: phoneOf(key.chatJid), direction, sender, wa_message_id: waMessageId,
         text: text || null, media_type: mediaType, is_business_context: isBusinessContext, gate_reason: gateReason,
         detected_language: detectedLanguage, language_confidence: languageConfidence, language_source: languageSource,
-        quoted_wa_message_id: quotedWaMessageId, quoted_is_business_context: quotedIsBusinessContext,
+        quoted_wa_message_id: quotedWaMessageId, quoted_is_business_context: !!quotedIsBusinessContext,
       });
       if (error) log.warn?.({ error }, "recordMessage failed (non-blocking)");
     },
@@ -111,15 +111,16 @@ export function createState(supabase, log = console) {
 
     async getSettings(businessId) {
       const { data } = await supabase.from("wam_clients").select("settings").eq("business_id", businessId).maybeSingle();
-      const activation = data?.settings?.whatsapp_activation || {};
+      const settings = data?.settings || {};
+      const activation = settings.activation_filter || settings.whatsapp_activation || {};
       return {
         enabled: activation.enabled !== false,
         business_session_ttl_seconds: activation.business_session_ttl_seconds ?? 900,
         debounce_seconds: activation.debounce_seconds ?? 4,
-        human_mute_seconds: activation.human_mute_seconds ?? 1800,
-        tenantKeywords: activation.keywords || [],
-        industryKeywords: activation.industry_keywords || [],
-        tenantDefaultLanguage: data?.settings?.default_language || null,
+        human_mute_seconds: activation.manual_mute_seconds ?? activation.human_mute_seconds ?? 1800,
+        tenantKeywords: settings.business_keywords || activation.keywords || [],
+        industryKeywords: settings.industry_keywords || activation.industry_keywords || [],
+        tenantDefaultLanguage: settings.default_language || null,
       };
     },
   };

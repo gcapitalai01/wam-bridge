@@ -4,7 +4,7 @@ import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, jidNormalize
 import QRCode from "qrcode";
 import { useSupabaseAuthState } from "./authState.js";
 
-export function createSessionManager({ supabase, logger, onMessages, onClientStatus }) {
+export function createSessionManager({ supabase, logger, onMessages, onClientStatus, canConnect }) {
   const sessions = new Map();
   const reconnectAttempts = new Map();
 
@@ -21,6 +21,14 @@ export function createSessionManager({ supabase, logger, onMessages, onClientSta
   }
 
   async function startSession(businessId, phoneNumberForPairing) {
+    if (canConnect) {
+      const access = await canConnect(businessId);
+      if (!access?.allowed) {
+        const reason = access?.reason || "WHATSAPP_NOT_AUTHORIZED";
+        throw Object.assign(new Error(reason), { code: "WHATSAPP_NOT_AUTHORIZED", accessReason: reason });
+      }
+    }
+
     const st = getState(businessId);
     if (st.connecting || (st.sock && st.status === "connected")) return st;
     st.connecting = true;

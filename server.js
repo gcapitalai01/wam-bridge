@@ -10,6 +10,7 @@ import { createSessionManager } from "./src/sessionManager.js";
 import { createState } from "./src/state.js";
 import { createPipeline } from "./src/pipeline.js";
 import { isIgnorableJid } from "./src/messageUtils.js";
+import { createWhatsAppAccessControl } from "./src/accessControl.js";
 
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://wkpvlgfirechfeppfutg.supabase.co";
@@ -25,6 +26,7 @@ if (!BRIDGE_KEY_OK) console.error("BRIDGE_API_KEY missing or shorter than 24 cha
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
+const checkWhatsAppAccess = createWhatsAppAccessControl(supabase, logger);
 const jidToPhone = (jid) => (jid || "").split("@")[0].split(":")[0];
 
 async function pingHumanTakeover(businessId, phone) {
@@ -81,7 +83,7 @@ const pipeline = createPipeline({
 });
 
 sessionManager = createSessionManager({
-  supabase, logger,
+  supabase, logger, canConnect: checkWhatsAppAccess,
   onClientStatus: (businessId, status, phone) =>
     supabase.from("wam_clients").upsert({ business_id: businessId, status, phone: phone || null, updated_at: new Date().toISOString() }, { onConflict: "business_id" }),
   onMessages: async (businessId, sock, { messages, type }) => {
@@ -131,7 +133,11 @@ app.post("/session/:businessId/start", requireBridgeKey, async (req, res) => {
     const st = await sessionManager.startSession(req.params.businessId, phoneNumber);
     if (phoneNumber && st.pairingCode) return res.json({ ok: true, pairingCode: st.pairingCode });
     res.json({ ok: true, status: st.status });
-  } catch (err) { logger.error({ err }, "start session failed"); res.status(500).json({ error: "Could not start the WhatsApp session." }); }
+  } catch (err) {
+    logger.error({ err }, "start session failed");
+    if (err?.code === "WHATSAPP_NOT_AUTHORIZED") return res.status(403).json({ error: err.accessReason || "PAID_PLAN_REQUIRED" });
+    res.status(500).json({ error: "Could not start the WhatsApp session." });
+  }
 });
 
 app.get("/session/:businessId/qr", requireBridgeKey, (req, res) => {

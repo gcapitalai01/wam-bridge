@@ -72,7 +72,7 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
 
     if (!(await state.canSend(key, batch.processingVersion))) return { status: "CANCELLED" }; // 13: re-read before send
     const id = await sendRegistered(key, reply);                                              // 14+15
-    await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: id, text: reply, isBusinessContext: true, detectedLanguage: language, languageSource: "reply" });
+    await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: id, text: reply, isBusinessContext: true, detectedLanguage: language, languageSource: "session" });
     return { status: "SENT", messageId: id };
   }
 
