@@ -48,6 +48,11 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     const batch = await state.claimBatch(key, debounceVersion);
     if (!batch?.items?.length) return { status: "SKIPPED" };
 
+    let finishOnExit = true;
+    const ks = keyStr(key);
+    const ac = new AbortController();
+    inflight.set(ks, ac);
+
     try {
       if (checkAccess) {
         const access = await checkAccess(key.businessId);
@@ -59,21 +64,34 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       const language = last.language || "en";
       const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
 
-      const ks = keyStr(key);
-      const ac = new AbortController();
-      inflight.set(ks, ac);
       let reply;
       try {
         reply = await ai({ key, items: batch.items, text, language, pushName, signal: ac.signal });
       } catch (e) {
         if (ac.signal.aborted) return { status: "CANCELLED" };
+        // Unknown/transient AI failure: keep processing_batch so stale recovery
+        // can safely retry later. No external WhatsApp send happened yet.
+        finishOnExit = false;
         throw e;
-      } finally {
-        if (inflight.get(ks) === ac) inflight.delete(ks);
       }
 
-      if (ac.signal.aborted || !reply) return { status: reply ? "CANCELLED" : "NO_REPLY" };
-      if (!(await state.canSend(key, batch.processingVersion))) return { status: "CANCELLED" };
+      if (ac.signal.aborted || !reply) {
+        return { status: ac.signal.aborted ? "CANCELLED" : "NO_REPLY" };
+      }
+
+      // Final atomic guard + commit BEFORE the external send.
+      // Once committed, a process crash can cause at most a missed reply, never
+      // a duplicate reply from stale-batch recovery.
+      let committed;
+      try {
+        committed = await state.commitProcessingForSend(key, batch.processingVersion);
+      } catch (e) {
+        finishOnExit = false;
+        throw e;
+      }
+      if (!committed || ac.signal.aborted) return { status: "CANCELLED" };
+
+      finishOnExit = false; // commitProcessingForSend already cleared the batch.
 
       const id = await sendRegistered(key, reply);
       await state.recordMessage(key, {
@@ -82,9 +100,8 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       });
       return { status: "SENT", messageId: id };
     } finally {
-      // The DB keeps processing_batch until this exact processing version finishes.
-      // If the process dies before here, the stale-recovery RPC restores the batch.
-      if (state.finishProcessing) {
+      if (inflight.get(ks) === ac) inflight.delete(ks);
+      if (finishOnExit && state.finishProcessing) {
         await state.finishProcessing(key, batch.processingVersion)
           .catch((e) => log.error?.({ e }, "finishProcessing failed"));
       }
