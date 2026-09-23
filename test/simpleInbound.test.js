@@ -2,11 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createSimpleInboundHandler } from "../src/simpleInbound.js";
 
-function raw(text, { id = "M1", fromMe = false, remoteJid = "15551234567@s.whatsapp.net" } = {}) {
+function raw(text, {
+  id = "M1",
+  fromMe = false,
+  remoteJid = "15551234567@s.whatsapp.net",
+  timestampMs = Date.now(),
+} = {}) {
   return {
     key: { remoteJid, id, fromMe },
     message: { conversation: text },
-    messageTimestamp: Math.floor(Date.now() / 1000),
+    messageTimestamp: Math.floor(timestampMs / 1000),
     pushName: "Customer",
   };
 }
@@ -101,7 +106,7 @@ test("fromMe never calls Brain or sends a reply", async () => {
   assert.equal(sends, 0);
 });
 
-test("groups and history append never reach Brain", async () => {
+test("groups and old history append never reach Brain", async () => {
   const state = fakeState();
   let brainCalls = 0;
 
@@ -124,13 +129,43 @@ test("groups and history append never reach Brain", async () => {
   const history = await handle({
     businessId: "b1",
     connectionId: "c1",
-    raw: raw("old message", { id: "H1" }),
+    raw: raw("old message", { id: "H1", timestampMs: Date.now() - 10 * 60 * 1000 }),
     upsertType: "append",
   });
 
   assert.equal(group.status, "JID_IGNORED");
   assert.equal(history.status, "HISTORY_IGNORED");
   assert.equal(brainCalls, 0);
+});
+
+test("fresh direct append can reach Brain once", async () => {
+  const state = fakeState();
+  let brainCalls = 0;
+  let sends = 0;
+
+  const handle = createSimpleInboundHandler({
+    state,
+    forwardIncomingToAI: async () => {
+      brainCalls += 1;
+      return { reply: "Respuesta append" };
+    },
+    sendRegistered: async () => {
+      sends += 1;
+      return "OUT-APPEND";
+    },
+    log: {},
+  });
+
+  const result = await handle({
+    businessId: "b1",
+    connectionId: "c1",
+    raw: raw("precio", { id: "APPEND-1" }),
+    upsertType: "append",
+  });
+
+  assert.equal(result.status, "SENT");
+  assert.equal(brainCalls, 1);
+  assert.equal(sends, 1);
 });
 
 test("Brain returning no reply causes no WhatsApp send", async () => {
