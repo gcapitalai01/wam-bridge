@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { useSupabaseAuthState } from "../src/authState.js";
 
-function fakeSupabase() {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function fakeSupabase({ upsertDelayForMarker = {} } = {}) {
   const rows = new Map();
 
   return {
@@ -21,6 +23,9 @@ function fakeSupabase() {
           };
         },
         async upsert(row) {
+          const marker = row?.value?.marker;
+          const delay = upsertDelayForMarker[marker] || 0;
+          if (delay) await sleep(delay);
           rows.set(`${row.business_id}|${row.data_key}`, row);
           return { error: null };
         },
@@ -64,6 +69,20 @@ test("Supabase auth store persists and reloads Signal keys", async () => {
 
   assert.equal(got.alice.marker, 7);
   assert.ok(db.rows.has("business-1|creds"));
+});
+
+test("Signal key writes are serialized so stale slow writes cannot win", async () => {
+  const db = fakeSupabase({ upsertDelayForMarker: { 1: 30, 2: 0 } });
+  const store = await useSupabaseAuthState(db, "business-1");
+
+  const slow = store.state.keys.set({ session: { alice: { marker: 1 } } });
+  await sleep(5);
+  const fast = store.state.keys.set({ session: { alice: { marker: 2 } } });
+
+  await Promise.all([slow, fast]);
+  const got = await store.state.keys.get("session", ["alice"]);
+
+  assert.equal(got.alice.marker, 2);
 });
 
 test("clearAll removes only this business auth state", async () => {
