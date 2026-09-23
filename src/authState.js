@@ -1,7 +1,27 @@
 // Baileys auth state persisted in Supabase.
-// Kept intentionally simple to match the older Bridge flow that was stable.
+// Signal key operations must be serialized per business_id. Parallel key writes
+// can make Baileys persist stale sessions after reconnects, producing Bad MAC /
+// "No matching sessions found" decrypt failures.
 import { initAuthCreds, BufferJSON, WAProto } from "@whiskeysockets/baileys";
 const proto = WAProto;
+
+const authLocks = new Map();
+
+async function withAuthLock(businessId, fn) {
+  const previous = authLocks.get(businessId) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => current);
+  authLocks.set(businessId, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (authLocks.get(businessId) === tail) authLocks.delete(businessId);
+  }
+}
 
 export async function useSupabaseAuthState(supabase, businessId) {
   const table = "wam_auth_state";
@@ -50,48 +70,45 @@ export async function useSupabaseAuthState(supabase, businessId) {
     if (error) throw new Error(`wam_auth_state delete: ${error.message}`);
   }
 
-  const creds = (await readData("creds")) || initAuthCreds();
+  const creds = (await withAuthLock(businessId, () => readData("creds"))) || initAuthCreds();
 
   return {
     state: {
       creds,
       keys: {
-        get: async (type, ids) => {
+        get: (type, ids) => withAuthLock(businessId, async () => {
           const out = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(`${type}-${id}`);
-              if (type === "app-state-sync-key" && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-              }
-              if (value) out[id] = value;
-            })
-          );
+          for (const id of ids || []) {
+            let value = await readData(`${type}-${id}`);
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            if (value) out[id] = value;
+          }
           return out;
-        },
+        }),
 
-        set: async (data) => {
-          const tasks = [];
+        set: (data) => withAuthLock(businessId, async () => {
           for (const category of Object.keys(data || {})) {
             for (const id of Object.keys(data[category] || {})) {
               const value = data[category][id];
               const key = `${category}-${id}`;
-              tasks.push(value ? writeData(key, value) : removeData(key));
+              if (value) await writeData(key, value);
+              else await removeData(key);
             }
           }
-          await Promise.all(tasks);
-        },
+        }),
       },
     },
 
-    saveCreds: () => writeData("creds", creds),
+    saveCreds: () => withAuthLock(businessId, () => writeData("creds", creds)),
 
-    clearAll: async () => {
+    clearAll: () => withAuthLock(businessId, async () => {
       const { error } = await supabase
         .from(table)
         .delete()
         .eq("business_id", businessId);
       if (error) throw new Error(`wam_auth_state clear: ${error.message}`);
-    },
+    }),
   };
 }
