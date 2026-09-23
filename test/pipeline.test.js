@@ -6,19 +6,26 @@ function fakeState(settingsOverride = {}) {
   const outbound = new Set();
   const messages = [];
   const chats = new Map();
+  const claims = new Set();
   const k = (key) => `${key.businessId}|${key.connectionId}|${key.chatJid}`;
-  const defaultSettings = { enabled: true, business_session_ttl_seconds: 900, debounce_seconds: 4, human_mute_seconds: 1800, tenantKeywords: [], industryKeywords: [], tenantDefaultLanguage: null, ...settingsOverride };
+  const defaultSettings = { enabled: true, business_session_ttl_seconds: 900, debounce_seconds: 4, human_mute_seconds: 300, tenantKeywords: [], industryKeywords: [], tenantDefaultLanguage: null, ...settingsOverride };
 
   return {
-    outbound, messages, chats,
+    outbound, messages, chats, claims,
     async isBotOutbound(_key, id) { return outbound.has(id); },
     async registerOutbound(_key, id) { outbound.add(id); },
-    async wasSeen(key, id) { return messages.some((m) => m.key === k(key) && m.waMessageId === id); },
+    async claimInboundEvent(key, id) {
+      const ck = `${k(key)}|${id}`;
+      if (claims.has(ck)) return false;
+      claims.add(ck);
+      return true;
+    },
     async recordMessage(key, m) { messages.push({ key: k(key), ...m }); },
     async getChatState(key) { return chats.get(k(key)) || null; },
     async resolveQuoted() { return null; },
     async muteForHuman(key, seconds) {
-      const row = { muted_until: new Date(Date.now() + seconds * 1000).toISOString(), business_session_active_until: null, pending_batch: [] };
+      const safeSeconds = Math.min(300, seconds);
+      const row = { muted_until: new Date(Date.now() + safeSeconds * 1000).toISOString(), business_session_active_until: null, pending_batch: [], processing_batch: [] };
       chats.set(k(key), row); return row;
     },
     async enqueue(key, item, { activate, reason, ttlSeconds, debounceMs }) {
@@ -41,7 +48,14 @@ function fakeState(settingsOverride = {}) {
     },
     async canSend(key, pv) { const row = chats.get(k(key)); return !!row && row.processingVersion === pv; },
     async persistLanguage(key, lang) { const row = chats.get(k(key)) || {}; row.detected_language = lang.language; chats.set(k(key), row); },
-    async clearProcessing(key, pv) { const row = chats.get(k(key)); if (row && row.processingVersion === pv) row.processingCleared = true; },
+    async finishProcessing(key, pv) {
+      const row = chats.get(k(key));
+      if (row && row.processingVersion === pv) {
+        row.processingCleared = true;
+        row.processing_batch = [];
+      }
+      return true;
+    },
     async dueBatches() { return []; },
     async getSettings() { return defaultSettings; },
   };
@@ -75,7 +89,7 @@ test("Business keyword => allowed true, session updated, debounce scheduled", as
   assert.equal(row.pending_batch.length, 1);
 });
 
-test("Human fromMe real message => 30-minute mute, cancels pending debounce, no AI on flush", async () => {
+test("Human fromMe real message => max 5-minute mute, cancels pending debounce, no AI on flush", async () => {
   const state = fakeState();
   let aiCalls = 0;
   const pipeline = createPipeline({ state, ai: async () => { aiCalls++; return "r"; }, send: { prepareId: async () => "id", deliver: async () => {} } });
@@ -85,7 +99,9 @@ test("Human fromMe real message => 30-minute mute, cancels pending debounce, no 
   const preFlushRow = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
   const r = await pipeline.handle(raw("ok", { id: "HUMAN1", fromMe: true }), opts);
   assert.equal(r.classification, "HUMAN_MANUAL");
-  assert.ok(state.chats.get("b1|c1|5215500000000@s.whatsapp.net").muted_until);
+  const mutedUntil = new Date(state.chats.get("b1|c1|5215500000000@s.whatsapp.net").muted_until).getTime();
+  assert.ok(mutedUntil - Date.now() <= 300500);
+  assert.ok(mutedUntil > Date.now());
   // Flushing the pre-mute debounce version must not call the AI (claimBatch sees pending_batch cleared / muted).
   await pipeline.flush(key, preFlushRow.debounceVersion);
   assert.equal(aiCalls, 0);
@@ -238,7 +254,7 @@ test("Revoked payment/admin access => zero AI, zero send, even after activation 
   assert.equal(sendCalls, 0);
 });
 
-test("History-sync append of an old fromMe message => HISTORY, never a 30-minute mute", async () => {
+test("History-sync append of an old fromMe message => HISTORY, never a human mute", async () => {
   const state = fakeState();
   const pipeline = createPipeline({ state, ai: async () => "x", send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = await pipeline.handle(raw("old outbound text", { fromMe: true, id: "OLD1" }), { businessId: "b1", connectionId: "c1", upsertType: "append" });
@@ -246,7 +262,7 @@ test("History-sync append of an old fromMe message => HISTORY, never a 30-minute
   assert.equal(state.chats.size, 0); // no mute row created
 });
 
-test("clearProcessing runs after a successful flush (guards processing_started_at)", async () => {
+test("finishProcessing runs after a successful flush (clears crash-recovery batch)", async () => {
   const state = fakeState();
   const pipeline = createPipeline({ state, ai: async () => "reply", send: { prepareId: async () => "id", deliver: async () => {} } });
   const opts = { businessId: "b1", connectionId: "c1" };
@@ -255,4 +271,18 @@ test("clearProcessing runs after a successful flush (guards processing_started_a
   const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
   await pipeline.flush(key, row.debounceVersion);
   assert.equal(row.processingCleared, true);
+});
+
+
+test("Two pipeline instances sharing the same DB claim process one inbound event only", async () => {
+  const state = fakeState();
+  const send = { prepareId: async () => "id", deliver: async () => {} };
+  const p1 = createPipeline({ state, ai: async () => "r", send });
+  const p2 = createPipeline({ state, ai: async () => "r", send });
+  const msg = raw("what is the price", { id: "RACE1" });
+  const opts = { businessId: "b1", connectionId: "c1" };
+  const first = await p1.handle(msg, opts);
+  const second = await p2.handle(msg, opts);
+  assert.equal(first.classification, "CUSTOMER");
+  assert.equal(second.classification, "DUPLICATE");
 });
