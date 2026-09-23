@@ -1,55 +1,128 @@
-// Baileys multi-file auth state persisted in Supabase (table wam_auth_state) —
-// no local disk, Render's filesystem is ephemeral.
+// Baileys auth state persisted in Supabase.
+// Signal key operations are serialized per business so concurrent crypto updates
+// cannot overwrite each other with stale state.
 import { initAuthCreds, BufferJSON, WAProto } from "@whiskeysockets/baileys";
 const proto = WAProto;
 
 export async function useSupabaseAuthState(supabase, businessId) {
+  let keyQueue = Promise.resolve();
+
+  const withKeyLock = (fn) => {
+    const run = keyQueue.then(fn, fn);
+    keyQueue = run.then(() => undefined, () => undefined);
+    return run;
+  };
+
+  const encode = (value) =>
+    JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+
+  const decode = (value) =>
+    JSON.parse(JSON.stringify(value), BufferJSON.reviver);
+
   async function readData(key) {
-    const { data, error } = await supabase.from("wam_auth_state").select("value")
-      .eq("business_id", businessId).eq("data_key", key).maybeSingle();
+    const { data, error } = await supabase
+      .from("wam_auth_state")
+      .select("value")
+      .eq("business_id", businessId)
+      .eq("data_key", key)
+      .maybeSingle();
+
     if (error) throw new Error(`wam_auth_state read: ${error.message}`);
-    return data ? JSON.parse(JSON.stringify(data.value), BufferJSON.reviver) : null;
+    return data ? decode(data.value) : null;
   }
+
   async function writeData(key, value) {
-    const json = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
     const { error } = await supabase.from("wam_auth_state").upsert(
-      { business_id: businessId, data_key: key, value: json, updated_at: new Date().toISOString() },
+      {
+        business_id: businessId,
+        data_key: key,
+        value: encode(value),
+        updated_at: new Date().toISOString(),
+      },
       { onConflict: "business_id,data_key" }
     );
+
     if (error) throw new Error(`wam_auth_state write: ${error.message}`);
-  }
-  async function removeData(key) {
-    await supabase.from("wam_auth_state").delete().eq("business_id", businessId).eq("data_key", key);
   }
 
   const creds = (await readData("creds")) || initAuthCreds();
 
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const out = {};
-          for (const id of ids) {
-            let value = await readData(`${type}-${id}`);
-            if (type === "app-state-sync-key" && value) value = proto.Message.AppStateSyncKeyData.fromObject(value);
-            if (value) out[id] = value;
+  const keys = {
+    get: (type, ids) =>
+      withKeyLock(async () => {
+        const out = {};
+
+        // Reads intentionally stay inside the same lock used by set().
+        // A Signal decrypt must never observe half of a concurrent key mutation.
+        for (const id of ids) {
+          let value = await readData(`${type}-${id}`);
+          if (type === "app-state-sync-key" && value) {
+            value = proto.Message.AppStateSyncKeyData.fromObject(value);
           }
-          return out;
-        },
-        set: async (data) => {
-          const tasks = [];
-          for (const category in data) {
-            for (const id in data[category]) {
-              const value = data[category][id];
-              tasks.push(value ? writeData(`${category}-${id}`, value) : removeData(`${category}-${id}`));
+          if (value) out[id] = value;
+        }
+
+        return out;
+      }),
+
+    set: (data) =>
+      withKeyLock(async () => {
+        const upserts = [];
+        const deletes = [];
+        const now = new Date().toISOString();
+
+        for (const category of Object.keys(data || {})) {
+          for (const id of Object.keys(data[category] || {})) {
+            const value = data[category][id];
+            const dataKey = `${category}-${id}`;
+
+            if (value) {
+              upserts.push({
+                business_id: businessId,
+                data_key: dataKey,
+                value: encode(value),
+                updated_at: now,
+              });
+            } else {
+              deletes.push(dataKey);
             }
           }
-          await Promise.all(tasks);
-        },
-      },
-    },
+        }
+
+        // A single batched UPSERT avoids Promise.all races between key writes.
+        if (upserts.length) {
+          const { error } = await supabase
+            .from("wam_auth_state")
+            .upsert(upserts, { onConflict: "business_id,data_key" });
+          if (error) throw new Error(`wam_auth_state key upsert: ${error.message}`);
+        }
+
+        if (deletes.length) {
+          const { error } = await supabase
+            .from("wam_auth_state")
+            .delete()
+            .eq("business_id", businessId)
+            .in("data_key", deletes);
+          if (error) throw new Error(`wam_auth_state key delete: ${error.message}`);
+        }
+      }),
+  };
+
+  return {
+    state: { creds, keys },
+
+    // Baileys mutates the same creds object; serializing this row is sufficient.
     saveCreds: () => writeData("creds", creds),
-    clearAll: async () => { await supabase.from("wam_auth_state").delete().eq("business_id", businessId); },
+
+    clearAll: async () => {
+      // Wait for any in-flight Signal key operation before clearing the session.
+      await withKeyLock(async () => {
+        const { error } = await supabase
+          .from("wam_auth_state")
+          .delete()
+          .eq("business_id", businessId);
+        if (error) throw new Error(`wam_auth_state clear: ${error.message}`);
+      });
+    },
   };
 }
