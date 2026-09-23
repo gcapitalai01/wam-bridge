@@ -1,11 +1,8 @@
 // Inbound pipeline — exact order:
-// 1 receive -> 2 idempotency -> 3 classify fromMe -> 4 mute if human outbound ->
+// 1 receive -> 2 atomic idempotency -> 3 classify fromMe -> 4 mute if human outbound ->
 // 5 normalize -> 6 detect language -> 7 evaluateBusinessIntent -> 8 stop if !allowed ->
 // 9 update session state -> 10 start/reset debounce -> 11 re-read state -> 12 AI ->
 // 13 re-read state -> 14 send in customer language -> 15 register outbound id.
-//
-// businessIntentGate.js and languageDetector.js are used exactly as published — no
-// changes, no re-implementation of their logic here.
 import { extractMessage, isIgnorableJid } from "./messageUtils.js";
 import { evaluateBusinessIntent } from "./businessIntentGate.js";
 import { detectCustomerLanguage } from "./languageDetector.js";
@@ -14,10 +11,10 @@ const HUMAN_FROM_ME_MAX_AGE_MS = 2 * 60 * 1000;
 const TEXTLESS_MEDIA = new Set(["audio", "image", "video", "document", "sticker"]);
 const keyStr = (k) => `${k.businessId}|${k.connectionId}|${k.chatJid}`;
 
-export function createPipeline({ state, ai, send, log = console, now = () => Date.now(), onHumanMessage }) {
+export function createPipeline({ state, ai, send, log = console, now = () => Date.now(), onHumanMessage, checkAccess }) {
   const timers = new Map();
   const inflight = new Map();
-  const seen = new Set(); // best-effort in-process idempotency, on top of the wam_messages check
+  const seen = new Set(); // fast local cache; Supabase atomic claim is authoritative across instances.
 
   function cancelPending(key) {
     const ks = keyStr(key);
@@ -42,89 +39,131 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
 
   async function sendRegistered(key, content) {
     const id = await send.prepareId(key);
-    await state.registerOutbound(key, id);        // step 15, done BEFORE the actual send
+    await state.registerOutbound(key, id);
     await send.deliver(key, content, id);
     return id;
   }
 
-  // Steps 11-14 (fires when the 4s debounce window elapses).
   async function flush(key, debounceVersion) {
-    const batch = await state.claimBatch(key, debounceVersion);   // 11: re-read state before AI
-    if (!batch?.items?.length) return { status: "SKIPPED" };      // 12: state no longer valid -> stop
+    const batch = await state.claimBatch(key, debounceVersion);
+    if (!batch?.items?.length) return { status: "SKIPPED" };
 
-    const last = batch.items[batch.items.length - 1];
-    const language = last.language || "en";
-    const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
-
+    let finishOnExit = true;
     const ks = keyStr(key);
     const ac = new AbortController();
     inflight.set(ks, ac);
-    let reply;
+
     try {
-      reply = await ai({ key, items: batch.items, text, language, signal: ac.signal });
-    } catch (e) {
-      if (ac.signal.aborted) return { status: "CANCELLED" };
-      throw e;
+      if (checkAccess) {
+        const access = await checkAccess(key.businessId);
+        if (!access?.allowed) return { status: "ACCESS_BLOCKED", reason: access?.reason };
+      }
+
+      const last = batch.items[batch.items.length - 1];
+      const pushName = last.pushName || null;
+      const language = last.language || "en";
+      const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
+
+      let reply;
+      try {
+        reply = await ai({ key, items: batch.items, text, language, pushName, signal: ac.signal });
+      } catch (e) {
+        if (ac.signal.aborted) return { status: "CANCELLED" };
+        // Unknown/transient AI failure: keep processing_batch so stale recovery
+        // can safely retry later. No external WhatsApp send happened yet.
+        finishOnExit = false;
+        throw e;
+      }
+
+      if (ac.signal.aborted || !reply) {
+        return { status: ac.signal.aborted ? "CANCELLED" : "NO_REPLY" };
+      }
+
+      // Final atomic guard + commit BEFORE the external send.
+      // Once committed, a process crash can cause at most a missed reply, never
+      // a duplicate reply from stale-batch recovery.
+      let committed;
+      try {
+        committed = await state.commitProcessingForSend(key, batch.processingVersion);
+      } catch (e) {
+        finishOnExit = false;
+        throw e;
+      }
+      if (!committed || ac.signal.aborted) return { status: "CANCELLED" };
+
+      finishOnExit = false; // commitProcessingForSend already cleared the batch.
+
+      const id = await sendRegistered(key, reply);
+      await state.recordMessage(key, {
+        direction: "out", sender: "bot", waMessageId: id, text: reply,
+        isBusinessContext: true, detectedLanguage: language, languageSource: "session",
+      });
+      return { status: "SENT", messageId: id };
     } finally {
       if (inflight.get(ks) === ac) inflight.delete(ks);
+      if (finishOnExit && state.finishProcessing) {
+        await state.finishProcessing(key, batch.processingVersion)
+          .catch((e) => log.error?.({ e }, "finishProcessing failed"));
+      }
     }
-    if (ac.signal.aborted || !reply) return { status: reply ? "CANCELLED" : "NO_REPLY" };
-
-    if (!(await state.canSend(key, batch.processingVersion))) return { status: "CANCELLED" }; // 13: re-read before send
-    const id = await sendRegistered(key, reply);                                              // 14+15
-    await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: id, text: reply, isBusinessContext: true, detectedLanguage: language, languageSource: "session" });
-    return { status: "SENT", messageId: id };
   }
 
   async function handle(raw, { businessId, connectionId, upsertType = "notify" }) {
-    // 1. receive
     const norm = extractMessage(raw);
     if (!norm || isIgnorableJid(norm.chatJid)) return { classification: "IGNORED" };
-    if (upsertType !== "notify" && !norm.fromMe) return { classification: "HISTORY" };
+    if (upsertType !== "notify") return { classification: "HISTORY" };
+
     const key = { businessId, connectionId, chatJid: norm.chatJid };
 
-    // 2. idempotency
+    // Atomic idempotency across processes/instances.
     const memKey = `${keyStr(key)}|${norm.id}`;
     if (seen.has(memKey)) return { classification: "DUPLICATE" };
+    const claimed = await state.claimInboundEvent(key, norm.id);
+    if (!claimed) {
+      seen.add(memKey);
+      return { classification: "DUPLICATE" };
+    }
     seen.add(memKey);
     if (seen.size > 5000) seen.delete(seen.values().next().value);
-    if (await state.wasSeen(key, norm.id)) return { classification: "DUPLICATE" };
 
-    // 3. classify fromMe
     if (norm.fromMe) {
       if (await state.isBotOutbound(key, norm.id)) return { classification: "BOT_OUTBOUND" };
       if (norm.messageType === "system") return { classification: "SYSTEM_EVENT" };
       if (norm.timestampMs && now() - norm.timestampMs > HUMAN_FROM_ME_MAX_AGE_MS) return { classification: "STALE_FROM_ME" };
-      // 4. real human outbound -> 30-minute mute, kill pending debounce/AI
+
       const settings = await state.getSettings(businessId);
       cancelPending(key);
       await state.muteForHuman(key, settings.human_mute_seconds);
-      await state.recordMessage(key, { direction: "out", sender: "human", waMessageId: norm.id, text: norm.text, mediaType: norm.messageType === "text" ? null : norm.messageType });
+      await state.recordMessage(key, {
+        direction: "out", sender: "human", waMessageId: norm.id, text: norm.text,
+        mediaType: norm.messageType === "text" ? null : norm.messageType,
+      });
       onHumanMessage?.(key);
       return { classification: "HUMAN_MANUAL" };
     }
 
-    // 5. normalize is done (norm); load chat state + settings + quoted context
     const chatState = await state.getChatState(key);
     const settings = await state.getSettings(businessId);
+
+    if (settings.enabled === false) {
+      return { classification: "CUSTOMER", decision: { allowed: false, reason: "AUTOMATION_DISABLED" } };
+    }
+
     const isMuted = !!chatState?.muted_until && new Date(chatState.muted_until).getTime() > now();
 
     let quotedContext = null;
     if (!isMuted && norm.quoted) quotedContext = await state.resolveQuoted(key, norm.quoted);
 
-    // 6. detect customer language (before the gate, as required)
-    const langInput = {
+    const lang = detectCustomerLanguage({
       text: norm.text,
       sessionLanguage: chatState?.detected_language || null,
       quotedLanguage: quotedContext?.language || null,
       tenantDefaultLanguage: settings.tenantDefaultLanguage,
-    };
-    const lang = detectCustomerLanguage(langInput);
+    });
     if (lang.language && norm.messageType !== "system") {
       await state.persistLanguage(key, lang);
     }
 
-    // 7. evaluateBusinessIntent
     const gate = evaluateBusinessIntent({
       text: norm.text,
       messageType: norm.messageType,
@@ -132,10 +171,13 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       isMuted,
       businessSessionActiveUntil: chatState?.business_session_active_until || null,
       now: new Date(now()),
-      quotedContext: quotedContext ? { verified: quotedContext.verified, isBusinessContext: quotedContext.isBusinessContext } : null,
+      quotedContext: quotedContext ? {
+        verified: quotedContext.verified,
+        isBusinessContext: quotedContext.isBusinessContext,
+      } : null,
       tenantKeywords: settings.tenantKeywords,
       industryKeywords: settings.industryKeywords,
-      mediaIntent: null, // no transcription/vision provider wired — never invent business intent for media
+      mediaIntent: null,
     });
 
     if (norm.messageType !== "system") {
@@ -144,22 +186,37 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
         mediaType: TEXTLESS_MEDIA.has(norm.messageType) ? norm.messageType : null,
         isBusinessContext: gate.allowed, gateReason: gate.reason,
         detectedLanguage: lang.language, languageConfidence: lang.confidence, languageSource: lang.source,
-        quotedWaMessageId: quotedContext?.waMessageId || null, quotedIsBusinessContext: quotedContext?.isBusinessContext ?? null,
+        quotedWaMessageId: quotedContext?.waMessageId || null,
+        quotedIsBusinessContext: quotedContext?.isBusinessContext ?? null,
       });
     }
 
-    // 8. STOP COMPLETELY if not allowed — no debounce, no AI, no fallback, no reply.
-    if (!gate.allowed) return { classification: "CUSTOMER", decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id } };
+    if (!gate.allowed) {
+      return {
+        classification: "CUSTOMER",
+        decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id },
+      };
+    }
 
-    // 9 + 10. update business-session state and start/reset the 4s debounce (one atomic call).
-    const item = { id: norm.id, type: norm.messageType, text: norm.text, language: lang.language, reason: gate.reason };
+    const item = {
+      id: norm.id, type: norm.messageType, text: norm.text, language: lang.language,
+      reason: gate.reason, pushName: norm.pushName || null,
+    };
     const q = await state.enqueue(key, item, {
-      activate: gate.activateSession, reason: gate.reason,
-      ttlSeconds: settings.business_session_ttl_seconds, debounceMs: settings.debounce_seconds * 1000,
+      activate: gate.activateSession,
+      reason: gate.reason,
+      ttlSeconds: settings.business_session_ttl_seconds,
+      debounceMs: settings.debounce_seconds * 1000,
     });
-    if (!q.accepted) return { classification: "CUSTOMER", decision: { allowed: false, reason: "MUTED" } }; // muted mid-flight
+    if (!q.accepted) {
+      return { classification: "CUSTOMER", decision: { allowed: false, reason: "MUTED" } };
+    }
+
     schedule(key, q.debounceVersion, q.dueAt);
-    return { classification: "CUSTOMER", decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id } };
+    return {
+      classification: "CUSTOMER",
+      decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id },
+    };
   }
 
   async function sweep(ownedBusinessIds) {
@@ -168,7 +225,8 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       if (ownedBusinessIds && !ownedBusinessIds.has(r.business_id)) continue;
       const key = { businessId: r.business_id, connectionId: r.connection_id, chatJid: r.chat_jid };
       if (timers.has(keyStr(key))) continue;
-      await flush(key, Number(r.debounce_version)).catch((e) => log.error?.({ e }, "sweep flush failed"));
+      await flush(key, Number(r.debounce_version))
+        .catch((e) => log.error?.({ e }, "sweep flush failed"));
     }
   }
 

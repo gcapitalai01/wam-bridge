@@ -72,3 +72,24 @@ export function createWhatsAppAccessControl(supabase, log = console) {
     return access;
   };
 }
+
+// Wraps any checkWhatsAppAccess-shaped function with a short in-memory cache so
+// per-message inbound automation and every /send call don't hammer the DB.
+// A lookup failure (thrown error) is NOT cached and fails closed (blocked),
+// so a transient DB error can never be mistaken for a cached "allowed".
+export function createCachedAccessCheck(checkFn, ttlMs = 60000) {
+  const cache = new Map(); // businessId -> { access, expiresAt }
+  return async function cachedCheck(businessId) {
+    const now = Date.now();
+    const hit = cache.get(businessId);
+    if (hit && hit.expiresAt > now) return hit.access;
+    try {
+      const access = await checkFn(businessId);
+      cache.set(businessId, { access, expiresAt: now + ttlMs });
+      return access;
+    } catch (err) {
+      cache.delete(businessId);
+      return { allowed: false, reason: "ACCESS_CHECK_FAILED" };
+    }
+  };
+}
