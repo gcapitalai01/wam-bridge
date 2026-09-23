@@ -1,6 +1,11 @@
 // One Baileys socket per business_id per active lease owner.
 // Auth lives in Supabase so deploys/restarts can reconnect without relinking.
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, jidNormalizedUser } from "@whiskeysockets/baileys";
+import makeWASocket, {
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  makeCacheableSignalKeyStore,
+} from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { useSupabaseAuthState } from "./authState.js";
 
@@ -123,7 +128,10 @@ export function createSessionManager({
       const { version } = await fetchLatestBaileysVersion();
       const sock = makeWASocket({
         version,
-        auth: authState,
+        auth: {
+          creds: authState.creds,
+          keys: makeCacheableSignalKeyStore(authState.keys, logger),
+        },
         logger,
         printQRInTerminal: false,
         browser: ["G Capital AI", "Chrome", "1.0"],
