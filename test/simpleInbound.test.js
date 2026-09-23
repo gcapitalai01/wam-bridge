@@ -7,10 +7,11 @@ function raw(text, {
   fromMe = false,
   remoteJid = "15551234567@s.whatsapp.net",
   timestampMs = Date.now(),
+  message = undefined,
 } = {}) {
   return {
     key: { remoteJid, id, fromMe },
-    message: { conversation: text },
+    message: message === undefined ? { conversation: text } : message,
     messageTimestamp: Math.floor(timestampMs / 1000),
     pushName: "Customer",
   };
@@ -76,7 +77,7 @@ test("same inbound message id reaches Brain and WhatsApp exactly once", async ()
   assert.equal(sends, 1);
 });
 
-test("fromMe never calls Brain or sends a reply", async () => {
+test("fromMe never calls Brain, sends a reply, or claims inbound", async () => {
   const state = fakeState();
   let brainCalls = 0;
   let sends = 0;
@@ -104,6 +105,7 @@ test("fromMe never calls Brain or sends a reply", async () => {
   assert.equal(result.status, "OWNER_MESSAGE");
   assert.equal(brainCalls, 0);
   assert.equal(sends, 0);
+  assert.equal(state.claims.size, 0);
 });
 
 test("groups and old history append never reach Brain", async () => {
@@ -191,4 +193,70 @@ test("Brain returning no reply causes no WhatsApp send", async () => {
 
   assert.equal(result.status, "NO_REPLY");
   assert.equal(sends, 0);
+});
+
+test("undecryptable messages are not claimed so a later Baileys retry can pass", async () => {
+  const state = fakeState();
+  let brainCalls = 0;
+
+  const handle = createSimpleInboundHandler({
+    state,
+    forwardIncomingToAI: async () => {
+      brainCalls += 1;
+      return { reply: "ok" };
+    },
+    sendRegistered: async () => "OUT",
+    log: {},
+  });
+
+  const bad = await handle({
+    businessId: "b1",
+    connectionId: "c1",
+    raw: raw("", { id: "RETRY-1", message: null }),
+    upsertType: "notify",
+  });
+  const good = await handle({
+    businessId: "b1",
+    connectionId: "c1",
+    raw: raw("Hola quiero precio", { id: "RETRY-1" }),
+    upsertType: "notify",
+  });
+
+  assert.equal(bad.status, "UNDECRYPTABLE_OR_UNSUPPORTED");
+  assert.equal(good.status, "SENT");
+  assert.equal(brainCalls, 1);
+  assert.equal(state.claims.size, 1);
+});
+
+test("non-text messages are not claimed and do not block a later text retry", async () => {
+  const state = fakeState();
+  let brainCalls = 0;
+
+  const handle = createSimpleInboundHandler({
+    state,
+    forwardIncomingToAI: async () => {
+      brainCalls += 1;
+      return { reply: "ok" };
+    },
+    sendRegistered: async () => "OUT",
+    log: {},
+  });
+
+  const noText = await handle({
+    businessId: "b1",
+    connectionId: "c1",
+    raw: raw("", { id: "MEDIA-1", message: { imageMessage: {} } }),
+    upsertType: "notify",
+  });
+  const withText = await handle({
+    businessId: "b1",
+    connectionId: "c1",
+    raw: raw("", { id: "MEDIA-1", message: { imageMessage: { caption: "quiero precio" } } }),
+    upsertType: "notify",
+  });
+
+  assert.equal(noText.status, "NON_TEXT_IGNORED");
+  assert.equal(withText.status, "SENT");
+  assert.equal(brainCalls, 1);
+  assert.equal(state.claims.size, 1);
 });
