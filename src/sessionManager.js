@@ -30,6 +30,7 @@ export function createSessionManager({
         phone: null,
         connecting: false,
         leaseTimer: null,
+        lastLeaseRenewedAt: null,
       });
     }
     return sessions.get(businessId);
@@ -38,6 +39,13 @@ export function createSessionManager({
   function clearLeaseTimer(st) {
     if (st?.leaseTimer) clearInterval(st.leaseTimer);
     if (st) st.leaseTimer = null;
+  }
+
+  function terminateForLeaseLoss(businessId, st, reason) {
+    clearLeaseTimer(st);
+    logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
+    try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
+    sessions.delete(businessId);
   }
 
   async function releaseBusinessLease(businessId, st) {
@@ -59,21 +67,24 @@ export function createSessionManager({
       });
     }
 
+    st.lastLeaseRenewedAt = Date.now();
     clearLeaseTimer(st);
     const timer = setInterval(async () => {
       try {
         const ok = await renewLease?.(businessId, instanceId, leaseSeconds);
         if (ok === false) {
-          clearLeaseTimer(st);
-          logger.error({ businessId, instanceId }, "WhatsApp session lease lost");
-          try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
-          sessions.delete(businessId);
+          terminateForLeaseLoss(businessId, st, "owner_changed");
+          return;
         }
+        st.lastLeaseRenewedAt = Date.now();
       } catch (err) {
-        // A transient DB error must not instantly kill a healthy socket.
-        // If renewals keep failing, the DB lease naturally expires and another
-        // instance can safely acquire it after this process stops/restarts.
         logger.error({ err, businessId }, "lease renewal failed");
+        const elapsed = Date.now() - (st.lastLeaseRenewedAt || 0);
+        // Fail closed before the DB lease can expire. This prevents a second
+        // instance from acquiring the same business while this socket remains live.
+        if (elapsed >= Math.floor(leaseSeconds * 1000 * 0.66)) {
+          terminateForLeaseLoss(businessId, st, "renewal_timeout");
+        }
       }
     }, leaseRenewMs);
     timer.unref?.();
