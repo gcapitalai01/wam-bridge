@@ -114,6 +114,13 @@ export function createState(supabase, log = console) {
       return !!(await rpc("wa_finish_processing", { ...k(key), p_processing_version: processingVersion }));
     },
 
+    async commitProcessingForSend(key, processingVersion) {
+      return !!(await rpc("wa_commit_processing_for_send", {
+        ...k(key),
+        p_processing_version: processingVersion,
+      }));
+    },
+
     async recoverStaleProcessing(staleSeconds = 120, limit = 50) {
       return (await rpc("wa_recover_stale_processing", {
         p_stale_seconds: staleSeconds,
