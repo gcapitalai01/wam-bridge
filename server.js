@@ -9,7 +9,7 @@ import { generateMessageIDV2, jidNormalizedUser } from "@whiskeysockets/baileys"
 
 import { createSessionManager } from "./src/sessionManager.js";
 import { createState } from "./src/state.js";
-import { extractMessage, isIgnorableJid } from "./src/messageUtils.js";
+import { createSimpleInboundHandler } from "./src/simpleInbound.js";
 import { createWhatsAppAccessControl, createCachedAccessCheck } from "./src/accessControl.js";
 
 const PORT = process.env.PORT || 10000;
@@ -39,19 +39,6 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const checkWhatsAppAccess = createWhatsAppAccessControl(supabase, logger);
 const checkWhatsAppAccessCached = createCachedAccessCheck(checkWhatsAppAccess, 60000);
 const state = createState(supabase, logger);
-
-const jidToPhone = (jid) => String(jid || "").split("@")[0].split(":")[0];
-
-function customerPhone(msg, fallbackJid) {
-  const candidates = [
-    msg?.key?.remoteJidAlt,
-    msg?.key?.participantPn,
-    msg?.key?.participantAlt,
-    fallbackJid,
-  ].filter(Boolean);
-  const pn = candidates.find((jid) => String(jid).endsWith("@s.whatsapp.net"));
-  return jidToPhone(pn || candidates[0] || "");
-}
 
 async function forwardIncomingToAI(payload) {
   const res = await fetch(WHATSAPP_WEBHOOK_URL, {
@@ -98,6 +85,13 @@ async function sendRegistered(key, payload) {
   return messageId;
 }
 
+const handleSimpleInbound = createSimpleInboundHandler({
+  state,
+  forwardIncomingToAI,
+  sendRegistered,
+  log: logger,
+});
+
 sessionManager = createSessionManager({
   supabase,
   logger,
@@ -118,120 +112,26 @@ sessionManager = createSessionManager({
     }, { onConflict: "business_id" }),
 
   onMessages: async (businessId, sock, { messages, type }) => {
-    // Only real-time messages. History/offline append must never trigger replies.
-    if (type !== "notify") return;
-
     const connectionId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
     if (!connectionId) return;
 
     for (const raw of messages || []) {
-      const remoteJid = raw?.key?.remoteJid || "";
-      if (isIgnorableJid(remoteJid)) continue;
-
-      const norm = extractMessage(raw);
-      if (!norm) {
-        logger.warn({
-          businessId,
-          upsertType: type,
-          remoteJid,
-          fromMe: !!raw?.key?.fromMe,
-          messageId: raw?.key?.id || null,
-          hasMessage: !!raw?.message,
-          messageStubType: raw?.messageStubType ?? null,
-        }, "WhatsApp message could not be decoded");
-        continue;
-      }
-
-      const key = {
-        businessId,
-        connectionId,
-        chatJid: norm.chatJid,
-      };
-
-      // The only inbound blocker: exact duplicate message id.
-      const claimed = await state.claimInboundEvent(key, norm.id);
-      if (!claimed) continue;
-
-      // Ignore everything sent by this WhatsApp account itself.
-      // Bot messages are pre-registered; owner/manual messages are simply ignored.
-      if (norm.fromMe) {
-        const botEcho = await state.isBotOutbound(key, norm.id).catch(() => false);
-        logger.debug({
-          businessId,
-          chatJid: norm.chatJid,
-          messageId: norm.id,
-          botEcho,
-        }, botEcho ? "bot outbound echo ignored" : "owner manual message ignored");
-        continue;
-      }
-
-      const text = String(norm.text || "").trim();
-      if (!text) {
-        logger.info({
-          businessId,
-          chatJid: norm.chatJid,
-          messageId: norm.id,
-          messageType: norm.messageType,
-        }, "non-text WhatsApp message ignored");
-        continue;
-      }
-
-      await state.recordMessage(key, {
-        direction: "in",
-        sender: "customer",
-        waMessageId: norm.id,
-        text,
-        mediaType: norm.messageType === "text" ? null : norm.messageType,
-      });
-
-      const phone = customerPhone(raw, norm.chatJid);
-      logger.info({
-        businessId,
-        chatJid: norm.chatJid,
-        messageId: norm.id,
-        phone,
-      }, "WhatsApp inbound forwarding to Brain");
-
       try {
-        const data = await forwardIncomingToAI({
-          business_id: businessId,
-          connection_id: connectionId,
-          chat_jid: norm.chatJid,
-          phone,
-          message: text,
-          messages: [{
-            id: norm.id,
-            type: norm.messageType,
-            text,
-          }],
-          push_name: norm.pushName || null,
+        const result = await handleSimpleInbound({
+          businessId,
+          connectionId,
+          raw,
+          upsertType: type,
         });
-
-        const reply = typeof data?.reply === "string" ? data.reply.trim() : "";
-        if (!reply) {
-          logger.warn({
+        if (result?.status === "SENT") {
+          logger.info({
             businessId,
-            chatJid: norm.chatJid,
-            messageId: norm.id,
-            reason: data?.reason || data?.error || null,
-          }, "Brain returned no WhatsApp reply");
-          continue;
+            inboundMessageId: result.inboundId,
+            outboundMessageId: result.outboundId,
+          }, "WhatsApp AI reply sent");
         }
-
-        const outboundId = await sendRegistered(key, { text: reply });
-        logger.info({
-          businessId,
-          chatJid: norm.chatJid,
-          inboundMessageId: norm.id,
-          outboundMessageId: outboundId,
-        }, "WhatsApp AI reply sent");
       } catch (err) {
-        logger.error({
-          err,
-          businessId,
-          chatJid: norm.chatJid,
-          messageId: norm.id,
-        }, "WhatsApp Brain/reply flow failed");
+        logger.error({ err, businessId }, "WhatsApp inbound flow failed");
       }
     }
   },
