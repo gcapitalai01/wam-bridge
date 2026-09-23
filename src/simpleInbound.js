@@ -1,6 +1,8 @@
 import { extractMessage, isIgnorableJid } from "./messageUtils.js";
 
 const jidToPhone = (jid) => String(jid || "").split("@")[0].split(":")[0];
+const LIVE_APPEND_MAX_AGE_MS = 5 * 60 * 1000;
+const CLOCK_SKEW_MS = 60 * 1000;
 
 export function resolveCustomerPhone(raw, fallbackJid) {
   const candidates = [
@@ -11,6 +13,12 @@ export function resolveCustomerPhone(raw, fallbackJid) {
   ].filter(Boolean);
   const pn = candidates.find((jid) => String(jid).endsWith("@s.whatsapp.net"));
   return jidToPhone(pn || candidates[0] || "");
+}
+
+function isFreshAppend(norm, now = Date.now()) {
+  if (!norm?.timestampMs) return false;
+  const age = now - norm.timestampMs;
+  return age >= -CLOCK_SKEW_MS && age <= LIVE_APPEND_MAX_AGE_MS;
 }
 
 export function createSimpleInboundHandler({
@@ -25,8 +33,6 @@ export function createSimpleInboundHandler({
     raw,
     upsertType = "notify",
   }) {
-    if (upsertType !== "notify") return { status: "HISTORY_IGNORED" };
-
     const remoteJid = raw?.key?.remoteJid || "";
     if (isIgnorableJid(remoteJid)) return { status: "JID_IGNORED" };
 
@@ -42,6 +48,11 @@ export function createSimpleInboundHandler({
         messageStubType: raw?.messageStubType ?? null,
       }, "WhatsApp message could not be decoded");
       return { status: "UNDECRYPTABLE_OR_UNSUPPORTED" };
+    }
+
+    if (upsertType !== "notify") {
+      const allowedFreshAppend = upsertType === "append" && !norm.fromMe && isFreshAppend(norm);
+      if (!allowedFreshAppend) return { status: "HISTORY_IGNORED" };
     }
 
     const key = { businessId, connectionId, chatJid: norm.chatJid };
@@ -74,6 +85,7 @@ export function createSimpleInboundHandler({
       chatJid: norm.chatJid,
       messageId: norm.id,
       phone,
+      upsertType,
     }, "WhatsApp inbound forwarding to Brain");
 
     const data = await forwardIncomingToAI({
