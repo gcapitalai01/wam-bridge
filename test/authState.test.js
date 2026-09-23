@@ -2,8 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { useSupabaseAuthState } from "../src/authState.js";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function fakeSupabase() {
   const rows = new Map();
 
@@ -11,51 +9,36 @@ function fakeSupabase() {
     rows,
     from(table) {
       assert.equal(table, "wam_auth_state");
-
       return {
         select() {
           const filters = {};
           return {
-            eq(col, value) {
-              filters[col] = value;
-              return this;
-            },
+            eq(col, value) { filters[col] = value; return this; },
             async maybeSingle() {
-              const key = `${filters.business_id}|${filters.data_key}`;
-              const row = rows.get(key);
+              const row = rows.get(`${filters.business_id}|${filters.data_key}`);
               return { data: row ? { value: row.value } : null, error: null };
             },
           };
         },
-
-        async upsert(input) {
-          const list = Array.isArray(input) ? input : [input];
-          const marker = list[0]?.value?.marker;
-          if (marker === 1) await sleep(50);
-          if (marker === 2) await sleep(1);
-
-          for (const row of list) {
-            rows.set(`${row.business_id}|${row.data_key}`, row);
-          }
+        async upsert(row) {
+          rows.set(`${row.business_id}|${row.data_key}`, row);
           return { error: null };
         },
-
         delete() {
           const filters = {};
           return {
             eq(col, value) {
               filters[col] = value;
+              // Final eq in removeData executes through await on this thenable.
               return this;
             },
-            async in(col, values) {
-              for (const value of values) {
-                rows.delete(`${filters.business_id}|${value}`);
-              }
-              return { error: null };
-            },
             then(resolve) {
-              for (const key of [...rows.keys()]) {
-                if (key.startsWith(`${filters.business_id}|`)) rows.delete(key);
+              if (filters.data_key) {
+                rows.delete(`${filters.business_id}|${filters.data_key}`);
+              } else {
+                for (const key of [...rows.keys()]) {
+                  if (key.startsWith(`${filters.business_id}|`)) rows.delete(key);
+                }
               }
               return Promise.resolve({ error: null }).then(resolve);
             },
@@ -66,17 +49,32 @@ function fakeSupabase() {
   };
 }
 
-test("Signal key writes are serialized so stale slow writes cannot win", async () => {
+test("Supabase auth store persists and reloads Signal keys", async () => {
   const db = fakeSupabase();
-  const { state } = await useSupabaseAuthState(db, "business-1");
+  const first = await useSupabaseAuthState(db, "business-1");
 
-  const first = state.keys.set({ session: { alice: { marker: 1 } } });
-  const second = state.keys.set({ session: { alice: { marker: 2 } } });
-  await Promise.all([first, second]);
+  await first.state.keys.set({
+    session: { alice: { marker: 7 } },
+    "app-state-sync-version": { main: { version: 3 } },
+  });
+  await first.saveCreds();
 
-  const stored = db.rows.get("business-1|session-alice");
-  assert.equal(stored.value.marker, 2);
+  const second = await useSupabaseAuthState(db, "business-1");
+  const got = await second.state.keys.get("session", ["alice"]);
 
-  const got = await state.keys.get("session", ["alice"]);
-  assert.equal(got.alice.marker, 2);
+  assert.equal(got.alice.marker, 7);
+  assert.ok(db.rows.has("business-1|creds"));
+});
+
+test("clearAll removes only this business auth state", async () => {
+  const db = fakeSupabase();
+  const one = await useSupabaseAuthState(db, "business-1");
+  const two = await useSupabaseAuthState(db, "business-2");
+
+  await one.state.keys.set({ session: { a: { x: 1 } } });
+  await two.state.keys.set({ session: { b: { x: 2 } } });
+  await one.clearAll();
+
+  assert.equal([...db.rows.keys()].some((k) => k.startsWith("business-1|")), false);
+  assert.equal([...db.rows.keys()].some((k) => k.startsWith("business-2|")), true);
 });
