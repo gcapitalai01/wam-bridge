@@ -41,12 +41,23 @@ function fakeState(settingsOverride = {}) {
     },
     async claimBatch(key, version) {
       const kk = k(key); const row = chats.get(kk);
-      if (!row || row.debounceVersion !== version || !row.pending_batch?.length) return null;
-      const items = row.pending_batch; row.pending_batch = [];
+      if (!row || row.debounceVersion !== version || !row.pending_batch?.length || row.processing_batch?.length) return null;
+      const items = row.pending_batch;
+      row.pending_batch = [];
+      row.processing_batch = items;
       row.processingVersion = (row.processingVersion || 0) + 1;
       return { items, processingVersion: row.processingVersion };
     },
     async canSend(key, pv) { const row = chats.get(k(key)); return !!row && row.processingVersion === pv; },
+    async commitProcessingForSend(key, pv) {
+      const row = chats.get(k(key));
+      if (!row || row.processingVersion !== pv) return false;
+      if (row.muted_until && new Date(row.muted_until).getTime() > Date.now()) return false;
+      row.processing_batch = [];
+      row.processingCleared = true;
+      row.processingVersion += 1;
+      return true;
+    },
     async persistLanguage(key, lang) { const row = chats.get(k(key)) || {}; row.detected_language = lang.language; chats.set(k(key), row); },
     async finishProcessing(key, pv) {
       const row = chats.get(k(key));
@@ -262,7 +273,7 @@ test("History-sync append of an old fromMe message => HISTORY, never a human mut
   assert.equal(state.chats.size, 0); // no mute row created
 });
 
-test("finishProcessing runs after a successful flush (clears crash-recovery batch)", async () => {
+test("successful send commits and clears crash-recovery batch before external delivery", async () => {
   const state = fakeState();
   const pipeline = createPipeline({ state, ai: async () => "reply", send: { prepareId: async () => "id", deliver: async () => {} } });
   const opts = { businessId: "b1", connectionId: "c1" };
@@ -285,4 +296,21 @@ test("Two pipeline instances sharing the same DB claim process one inbound event
   const second = await p2.handle(msg, opts);
   assert.equal(first.classification, "CUSTOMER");
   assert.equal(second.classification, "DUPLICATE");
+});
+
+
+test("AI failure leaves claimed batch recoverable instead of clearing it", async () => {
+  const state = fakeState();
+  const pipeline = createPipeline({
+    state,
+    ai: async () => { throw new Error("temporary ai failure"); },
+    send: { prepareId: async () => "id", deliver: async () => {} },
+  });
+  const opts = { businessId: "b1", connectionId: "c1" };
+  await pipeline.handle(raw("what is the price", { id: "RECOVER1" }), opts);
+  const key = { businessId: "b1", connectionId: "c1", chatJid: "5215500000000@s.whatsapp.net" };
+  const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
+  await assert.rejects(() => pipeline.flush(key, row.debounceVersion), /temporary ai failure/);
+  assert.equal(row.processing_batch.length, 1);
+  assert.notEqual(row.processingCleared, true);
 });
