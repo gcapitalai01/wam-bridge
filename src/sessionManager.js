@@ -4,7 +4,6 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
-  makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { useSupabaseAuthState } from "./authState.js";
@@ -128,10 +127,7 @@ export function createSessionManager({
       const { version } = await fetchLatestBaileysVersion();
       const sock = makeWASocket({
         version,
-        auth: {
-          creds: authState.creds,
-          keys: makeCacheableSignalKeyStore(authState.keys, logger),
-        },
+        auth: authState,
         logger,
         printQRInTerminal: false,
         browser: ["G Capital AI", "Chrome", "1.0"],
