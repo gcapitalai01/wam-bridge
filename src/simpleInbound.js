@@ -34,42 +34,74 @@ export function createSimpleInboundHandler({
     upsertType = "notify",
   }) {
     const remoteJid = raw?.key?.remoteJid || "";
-    if (isIgnorableJid(remoteJid)) return { status: "JID_IGNORED" };
+    const messageId = raw?.key?.id || null;
+
+    if (isIgnorableJid(remoteJid)) {
+      log.debug?.({ businessId, upsertType, remoteJid, messageId }, "WhatsApp inbound ignored by JID");
+      return { status: "JID_IGNORED" };
+    }
 
     const norm = extractMessage(raw);
     if (!norm) {
+      // Important: do NOT claim/dedupe this event. Baileys can later retry and
+      // deliver the same WhatsApp message id after Signal sessions recover.
       log.warn?.({
         businessId,
         upsertType,
         remoteJid,
         fromMe: !!raw?.key?.fromMe,
-        messageId: raw?.key?.id || null,
+        messageId,
         hasMessage: !!raw?.message,
         messageStubType: raw?.messageStubType ?? null,
-      }, "WhatsApp message could not be decoded");
+        rawMessageKeys: raw?.message ? Object.keys(raw.message) : [],
+      }, "WhatsApp message could not be decoded; leaving unclaimed for retry");
       return { status: "UNDECRYPTABLE_OR_UNSUPPORTED" };
     }
 
     if (upsertType !== "notify") {
       const allowedFreshAppend = upsertType === "append" && !norm.fromMe && isFreshAppend(norm);
-      if (!allowedFreshAppend) return { status: "HISTORY_IGNORED" };
+      if (!allowedFreshAppend) {
+        log.debug?.({
+          businessId,
+          upsertType,
+          chatJid: norm.chatJid,
+          messageId: norm.id,
+          fromMe: norm.fromMe,
+          timestampMs: norm.timestampMs,
+        }, "WhatsApp history append ignored");
+        return { status: "HISTORY_IGNORED" };
+      }
     }
 
     const key = { businessId, connectionId, chatJid: norm.chatJid };
 
-    // Atomic database claim is the authority. If WhatsApp retries the same
-    // message, only the first copy can ever reach the Brain.
-    const claimed = await state.claimInboundEvent(key, norm.id);
-    if (!claimed) return { status: "DUPLICATE" };
-
-    // Never answer this account's own outbound/manual messages.
+    // Never answer this account's own outbound/manual messages. Also do not
+    // claim them as inbound, because the claim table is only for customer text
+    // that is eligible to reach the Brain.
     if (norm.fromMe) {
       const botEcho = await state.isBotOutbound(key, norm.id).catch(() => false);
       return { status: botEcho ? "BOT_ECHO" : "OWNER_MESSAGE" };
     }
 
     const text = String(norm.text || "").trim();
-    if (!text) return { status: "NON_TEXT_IGNORED" };
+    if (!text) {
+      // Do not poison dedupe with media/system/non-text stubs. A later retry can
+      // carry a caption/text for the same id depending on Baileys decrypt state.
+      log.info?.({
+        businessId,
+        upsertType,
+        chatJid: norm.chatJid,
+        messageId: norm.id,
+        messageType: norm.messageType,
+      }, "WhatsApp inbound ignored because no text was available");
+      return { status: "NON_TEXT_IGNORED" };
+    }
+
+    // Atomic database claim happens only after the message is confirmed usable.
+    // This prevents undecryptable/system/fromMe events from blocking a later
+    // valid retry with the same WhatsApp message id.
+    const claimed = await state.claimInboundEvent(key, norm.id);
+    if (!claimed) return { status: "DUPLICATE" };
 
     await state.recordMessage(key, {
       direction: "in",
@@ -84,6 +116,7 @@ export function createSimpleInboundHandler({
       businessId,
       chatJid: norm.chatJid,
       messageId: norm.id,
+      messageType: norm.messageType,
       phone,
       upsertType,
     }, "WhatsApp inbound forwarding to Brain");
