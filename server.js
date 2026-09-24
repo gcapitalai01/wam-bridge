@@ -46,6 +46,7 @@ async function forwardIncomingToAI(payload) {
     headers: {
       "Content-Type": "application/json",
       "x-bridge-secret": WHATSAPP_BRIDGE_SECRET,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
     },
     body: JSON.stringify(payload),
   });
