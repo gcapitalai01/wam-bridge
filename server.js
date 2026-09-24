@@ -1,6 +1,6 @@
 // G Capital AI — WhatsApp Bridge.
-// Intentionally simple: live direct message -> central Brain -> one WhatsApp reply.
-// No business-intent gate, debounce, language gate, manual mute, or session TTL.
+// Production inbound path: Baileys -> idempotency/fromMe -> business-intent gate ->
+// debounce/state validation -> central Brain -> verified WhatsApp send.
 import express from "express";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
@@ -9,7 +9,7 @@ import { generateMessageIDV2, jidNormalizedUser } from "@whiskeysockets/baileys"
 
 import { createSessionManager } from "./src/sessionManager.js";
 import { createState } from "./src/state.js";
-import { createSimpleInboundHandler } from "./src/simpleInbound.js";
+import { createPipeline } from "./src/pipeline.js";
 import { createWhatsAppAccessControl, createCachedAccessCheck } from "./src/accessControl.js";
 
 const PORT = process.env.PORT || 10000;
@@ -40,7 +40,7 @@ const checkWhatsAppAccess = createWhatsAppAccessControl(supabase, logger);
 const checkWhatsAppAccessCached = createCachedAccessCheck(checkWhatsAppAccess, 60000);
 const state = createState(supabase, logger);
 
-async function forwardIncomingToAI(payload) {
+async function forwardIncomingToAI(payload, signal) {
   const res = await fetch(WHATSAPP_WEBHOOK_URL, {
     method: "POST",
     headers: {
@@ -48,6 +48,7 @@ async function forwardIncomingToAI(payload) {
       "x-bridge-secret": WHATSAPP_BRIDGE_SECRET,
     },
     body: JSON.stringify(payload),
+    signal,
   });
 
   const data = await res.json().catch(() => ({}));
@@ -85,11 +86,47 @@ async function sendRegistered(key, payload) {
   return messageId;
 }
 
-const handleSimpleInbound = createSimpleInboundHandler({
+const inboundPipeline = createPipeline({
   state,
-  forwardIncomingToAI,
-  sendRegistered,
   log: logger,
+  checkAccess: checkWhatsAppAccessCached,
+  ai: async ({ key, items, text, language, pushName, signal }) => {
+    const phone = String(key.chatJid || "").endsWith("@s.whatsapp.net")
+      ? String(key.chatJid).split("@")[0].split(":")[0]
+      : null;
+    const data = await forwardIncomingToAI({
+      business_id: key.businessId,
+      connection_id: key.connectionId,
+      chat_jid: key.chatJid,
+      phone,
+      message: text,
+      messages: (items || []).map((item) => ({
+        id: item.id,
+        type: item.type,
+        text: item.text,
+      })),
+      push_name: pushName || null,
+      detected_language: language || null,
+    }, signal);
+    return typeof data?.reply === "string" ? data.reply.trim() : "";
+  },
+  send: {
+    prepareId: async (key) => {
+      const st = sessionManager?.getState(key.businessId);
+      if (!st?.sock || st.status !== "connected") {
+        throw new Error("WhatsApp session is not connected.");
+      }
+      return generateMessageIDV2(st.sock.user?.id);
+    },
+    deliver: async (key, content, messageId) => {
+      const st = sessionManager?.getState(key.businessId);
+      if (!st?.sock || st.status !== "connected") {
+        throw new Error("WhatsApp session is not connected.");
+      }
+      const payload = typeof content === "string" ? { text: content } : content;
+      await st.sock.sendMessage(key.chatJid, payload, { messageId });
+    },
+  },
 });
 
 sessionManager = createSessionManager({
@@ -117,25 +154,30 @@ sessionManager = createSessionManager({
 
     for (const raw of messages || []) {
       try {
-        const result = await handleSimpleInbound({
+        const result = await inboundPipeline.handle(raw, {
           businessId,
           connectionId,
-          raw,
           upsertType: type,
         });
-        if (result?.status === "SENT") {
-          logger.info({
-            businessId,
-            inboundMessageId: result.inboundId,
-            outboundMessageId: result.outboundId,
-          }, "WhatsApp AI reply sent");
-        }
+        logger.debug?.({
+          businessId,
+          classification: result?.classification || null,
+          allowed: result?.decision?.allowed ?? null,
+          reason: result?.decision?.reason || null,
+        }, "WhatsApp inbound classified");
       } catch (err) {
         logger.error({ err, businessId }, "WhatsApp inbound flow failed");
       }
     }
   },
 });
+
+const inboundSweep = setInterval(() => {
+  inboundPipeline.sweep().catch((err) =>
+    logger.error({ err }, "WhatsApp inbound recovery sweep failed")
+  );
+}, 2000);
+inboundSweep.unref?.();
 
 async function sendViaBridge(businessId, phone, payload) {
   const st = sessionManager.getState(businessId);

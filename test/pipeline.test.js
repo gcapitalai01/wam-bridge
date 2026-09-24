@@ -314,3 +314,26 @@ test("AI failure leaves claimed batch recoverable instead of clearing it", async
   assert.equal(row.processing_batch.length, 1);
   assert.notEqual(row.processingCleared, true);
 });
+
+
+test("Fresh direct append keeps the full business-intent gate and can enter debounce", async () => {
+  const state = fakeState();
+  const pipeline = createPipeline({ state, ai: async () => "reply", send: { prepareId: async () => "id", deliver: async () => {} } });
+  const r = raw("what is the price", { id: "APPEND-FRESH" });
+  const result = await pipeline.handle(r, { businessId: "b1", connectionId: "c1", upsertType: "append" });
+  assert.equal(result.classification, "CUSTOMER");
+  assert.equal(result.decision.allowed, true);
+  const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
+  assert.equal(row.pending_batch.length, 1);
+});
+
+test("Fresh personal append is still blocked before AI/debounce", async () => {
+  const state = fakeState();
+  let aiCalls = 0;
+  const pipeline = createPipeline({ state, ai: async () => { aiCalls++; return "reply"; }, send: { prepareId: async () => "id", deliver: async () => {} } });
+  const r = raw("hola", { id: "APPEND-PERSONAL" });
+  const result = await pipeline.handle(r, { businessId: "b1", connectionId: "c1", upsertType: "append" });
+  assert.equal(result.decision.allowed, false);
+  assert.equal(result.decision.reason, "PERSONAL_MESSAGE");
+  assert.equal(aiCalls, 0);
+});

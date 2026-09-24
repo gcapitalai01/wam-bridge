@@ -8,8 +8,16 @@ import { evaluateBusinessIntent } from "./businessIntentGate.js";
 import { detectCustomerLanguage } from "./languageDetector.js";
 
 const HUMAN_FROM_ME_MAX_AGE_MS = 2 * 60 * 1000;
+const LIVE_APPEND_MAX_AGE_MS = 5 * 60 * 1000;
+const CLOCK_SKEW_MS = 60 * 1000;
 const TEXTLESS_MEDIA = new Set(["audio", "image", "video", "document", "sticker"]);
 const keyStr = (k) => `${k.businessId}|${k.connectionId}|${k.chatJid}`;
+
+function isFreshAppend(norm, nowMs) {
+  if (!norm?.timestampMs) return false;
+  const age = nowMs - norm.timestampMs;
+  return age >= -CLOCK_SKEW_MS && age <= LIVE_APPEND_MAX_AGE_MS;
+}
 
 export function createPipeline({ state, ai, send, log = console, now = () => Date.now(), onHumanMessage, checkAccess }) {
   const timers = new Map();
@@ -111,7 +119,10 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
   async function handle(raw, { businessId, connectionId, upsertType = "notify" }) {
     const norm = extractMessage(raw);
     if (!norm || isIgnorableJid(norm.chatJid)) return { classification: "IGNORED" };
-    if (upsertType !== "notify") return { classification: "HISTORY" };
+    if (upsertType !== "notify") {
+      const allowedFreshAppend = upsertType === "append" && !norm.fromMe && isFreshAppend(norm, now());
+      if (!allowedFreshAppend) return { classification: "HISTORY" };
+    }
 
     const key = { businessId, connectionId, chatJid: norm.chatJid };
 
