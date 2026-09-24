@@ -1,6 +1,7 @@
 // One Baileys socket per business_id per active lease owner.
 // Auth lives in Supabase so deploys/restarts can reconnect without relinking.
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
@@ -134,7 +135,7 @@ export function createSessionManager({
         },
         logger,
         printQRInTerminal: false,
-        browser: ["G Capital AI", "Chrome", "1.0"],
+        browser: Browsers.ubuntu("Chrome"),
         markOnlineOnConnect: false,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
