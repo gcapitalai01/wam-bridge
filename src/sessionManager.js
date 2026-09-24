@@ -167,6 +167,9 @@ export function createSessionManager({
         markOnlineOnConnect: false,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
+        // We do not use privacy/blocklist/business-profile init queries. They are
+        // optional in Baileys and can time out/reconnect long-lived headless sockets.
+        fireInitQueries: false,
         getMessage: async () => undefined,
       });
 
