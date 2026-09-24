@@ -3,6 +3,7 @@ export function evaluateWhatsAppAccess({
   deletedAt = null,
   businessSubscriptionStatus = null,
   hasActiveSubscription = false,
+  validTrial = false,
   adminOverride = false,
 } = {}) {
   if (!businessExists || deletedAt) {
@@ -17,6 +18,10 @@ export function evaluateWhatsAppAccess({
     return { allowed: true, reason: "ACTIVE_PAID_SUBSCRIPTION" };
   }
 
+  if (businessSubscriptionStatus === "trial" && validTrial) {
+    return { allowed: true, reason: "ACTIVE_TRIAL" };
+  }
+
   return { allowed: false, reason: "PAID_PLAN_REQUIRED" };
 }
 
@@ -24,7 +29,7 @@ export function createWhatsAppAccessControl(supabase, log = console) {
   return async function checkWhatsAppAccess(businessId) {
     const { data: business, error: businessError } = await supabase
       .from("businesses")
-      .select("id, deleted_at, subscription_status")
+      .select("id, deleted_at, subscription_status, trial_days, created_at")
       .eq("id", businessId)
       .maybeSingle();
 
@@ -60,11 +65,19 @@ export function createWhatsAppAccessControl(supabase, log = console) {
       throw new Error(`whatsapp access override lookup: ${overrideResult.error.message}`);
     }
 
+    const trialDays = Math.max(0, Number(business.trial_days) || 0);
+    const trialStartedAt = Date.parse(business.created_at || "");
+    const validTrial = business.subscription_status === "trial"
+      && trialDays > 0
+      && Number.isFinite(trialStartedAt)
+      && Date.now() < trialStartedAt + trialDays * 86400000;
+
     const access = evaluateWhatsAppAccess({
       businessExists: true,
       deletedAt: business.deleted_at,
       businessSubscriptionStatus: business.subscription_status,
       hasActiveSubscription: (subscriptionResult.data || []).length > 0,
+      validTrial,
       adminOverride: overrideResult.data?.enabled === true,
     });
 
