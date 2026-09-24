@@ -24,7 +24,34 @@ export function createSessionManager({
 }) {
   const sessions = new Map();
   const reconnectAttempts = new Map();
+  const resumeRetryTimers = new Map();
   const leaseRenewMs = Math.max(5000, Math.floor((leaseSeconds * 1000) / 3));
+  const leaseRetryMs = Math.max(5000, leaseSeconds * 1000 + 1000);
+
+  function clearResumeRetry(businessId) {
+    const timer = resumeRetryTimers.get(businessId);
+    if (timer) clearTimeout(timer);
+    resumeRetryTimers.delete(businessId);
+  }
+
+  function scheduleResumeRetry(businessId) {
+    if (resumeRetryTimers.has(businessId)) return;
+    const timer = setTimeout(async () => {
+      resumeRetryTimers.delete(businessId);
+      try {
+        await startSession(businessId);
+      } catch (e) {
+        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+          logger.info({ businessId, instanceId }, "WhatsApp lease still owned elsewhere; retry scheduled");
+          scheduleResumeRetry(businessId);
+          return;
+        }
+        logger.error({ e, businessId }, "WhatsApp lease takeover retry failed");
+      }
+    }, leaseRetryMs);
+    timer.unref?.();
+    resumeRetryTimers.set(businessId, timer);
+  }
 
   function getState(businessId) {
     if (!sessions.has(businessId)) {
@@ -73,6 +100,7 @@ export function createSessionManager({
       });
     }
 
+    clearResumeRetry(businessId);
     st.lastLeaseRenewedAt = Date.now();
     clearLeaseTimer(st);
     const timer = setInterval(async () => {
@@ -200,9 +228,13 @@ export function createSessionManager({
             const delay = Math.min(3000 * Math.pow(2, attempt - 1), 60000);
             sessions.delete(businessId);
             setTimeout(() => {
-              startSession(businessId).catch((e) =>
-                logger.error({ e, businessId }, "reconnect failed")
-              );
+              startSession(businessId).catch((e) => {
+                if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+                  scheduleResumeRetry(businessId);
+                  return;
+                }
+                logger.error({ e, businessId }, "reconnect failed");
+              });
             }, delay).unref?.();
           }
         }
@@ -226,6 +258,7 @@ export function createSessionManager({
 
   async function stopSession(businessId) {
     const st = getState(businessId);
+    clearResumeRetry(businessId);
     clearLeaseTimer(st);
     if (st.sock) {
       try { await st.sock.logout(); } catch (_) {}
@@ -248,14 +281,18 @@ export function createSessionManager({
 
     for (const row of data || []) {
       startSession(row.business_id).catch((e) => {
-        if (e?.code !== "SESSION_OWNED_ELSEWHERE") {
-          logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
+        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+          scheduleResumeRetry(row.business_id);
+          return;
         }
+        logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
       });
     }
   }
 
   async function shutdownAll() {
+    for (const timer of resumeRetryTimers.values()) clearTimeout(timer);
+    resumeRetryTimers.clear();
     const entries = [...sessions.entries()];
     for (const [businessId, st] of entries) {
       clearLeaseTimer(st);
