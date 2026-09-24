@@ -26,9 +26,15 @@ test("admin WhatsApp override can connect without paid status", () => {
   assert.equal(result.reason, "ADMIN_OVERRIDE");
 });
 
-test("trial does not connect unless admin overrides it", () => {
-  assert.equal(evaluateWhatsAppAccess({ businessExists: true, businessSubscriptionStatus: "trial" }).allowed, false);
-  assert.equal(evaluateWhatsAppAccess({ businessExists: true, businessSubscriptionStatus: "trial", adminOverride: true }).allowed, true);
+test("valid trial can connect", () => {
+  const result = evaluateWhatsAppAccess({ businessExists: true, businessSubscriptionStatus: "trial", validTrial: true });
+  assert.equal(result.allowed, true);
+  assert.equal(result.reason, "ACTIVE_TRIAL");
+});
+
+test("expired trial cannot connect without admin override", () => {
+  assert.equal(evaluateWhatsAppAccess({ businessExists: true, businessSubscriptionStatus: "trial", validTrial: false }).allowed, false);
+  assert.equal(evaluateWhatsAppAccess({ businessExists: true, businessSubscriptionStatus: "trial", validTrial: false, adminOverride: true }).allowed, true);
 });
 
 test("cached access check reuses the result within the TTL", async () => {
