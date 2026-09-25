@@ -133,7 +133,14 @@ export function createSessionManager({
     clearResumeRetry(businessId);
     st.lastLeaseRenewedAt = Date.now();
     clearLeaseTimer(st);
+    let renewInFlight = false;
     const timer = setInterval(async () => {
+      // Never let a slow/hung renewal call pile another one on top of it for
+      // the SAME business -- at scale (many businesses, each with their own
+      // timer) that is what turns one transient Supabase slowdown into a
+      // burst of concurrent duplicate requests.
+      if (renewInFlight) return;
+      renewInFlight = true;
       try {
         const ok = await renewLease?.(businessId, instanceId, leaseSeconds);
         if (ok === false) {
@@ -149,6 +156,8 @@ export function createSessionManager({
         if (elapsed >= Math.floor(leaseSeconds * 1000 * 0.66)) {
           terminateForLeaseLoss(businessId, st, "renewal_timeout");
         }
+      } finally {
+        renewInFlight = false;
       }
     }, leaseRenewMs);
     timer.unref?.();
