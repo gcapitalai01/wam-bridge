@@ -77,14 +77,14 @@ async function forwardIncomingToAI(payload, signal) {
 
 let sessionManager;
 
-async function sendRegistered(key, payload) {
+async function sendRegistered(key, payload, forcedMessageId = null) {
   const st = sessionManager.getState(key.businessId);
   if (!st?.sock || st.status !== "connected") {
     throw new Error("WhatsApp session is not connected.");
   }
 
   const content = typeof payload === "string" ? { text: payload } : payload;
-  const messageId = generateMessageIDV2(st.sock.user?.id);
+  const messageId = forcedMessageId || generateMessageIDV2(st.sock.user?.id);
 
   // Register before send so the resulting fromMe echo can never loop back into AI.
   await state.registerOutbound(key, messageId);
@@ -219,7 +219,7 @@ async function runSweepOnce() {
 sweepTimer = setTimeout(runSweepOnce, sweepDelayMs);
 sweepTimer.unref?.();
 
-async function sendViaBridge(businessId, phone, payload) {
+async function sendViaBridge(businessId, phone, payload, forcedMessageId = null) {
   const st = sessionManager.getState(businessId);
   if (!st?.sock || st.status !== "connected") {
     throw new Error("This WhatsApp session is not connected on this bridge instance.");
@@ -227,7 +227,98 @@ async function sendViaBridge(businessId, phone, payload) {
 
   const connectionId = jidNormalizedUser(st.sock.user.id);
   const chatJid = `${String(phone).replace(/[^0-9]/g, "")}@s.whatsapp.net`;
-  return sendRegistered({ businessId, connectionId, chatJid }, payload);
+  return sendRegistered({ businessId, connectionId, chatJid }, payload, forcedMessageId);
+}
+
+const OUTBOUND_PENDING_TTL_MS = 5 * 60 * 1000;
+
+async function claimOutboundIdempotency(businessId, idempotencyKey, phone, proposedMessageId) {
+  const key = String(idempotencyKey || "").trim().slice(0, 240);
+  if (!key) return { state: "new", messageId: proposedMessageId, idempotencyKey: null };
+
+  const row = {
+    business_id: businessId,
+    idempotency_key: key,
+    phone: String(phone).replace(/[^0-9]/g, ""),
+    message_id: proposedMessageId,
+    status: "processing",
+    updated_at: new Date().toISOString(),
+  };
+  const { data: inserted, error: insertErr } = await supabase
+    .from("wam_outbound_idempotency")
+    .insert(row)
+    .select("id,business_id,idempotency_key,phone,message_id,status,error,updated_at,sent_at")
+    .maybeSingle();
+
+  if (!insertErr && inserted) {
+    return { state: "new", messageId: inserted.message_id, idempotencyKey: key };
+  }
+  if (insertErr?.code !== "23505") {
+    throw new Error(`outbound idempotency claim failed: ${insertErr?.message || "unknown"}`);
+  }
+
+  const { data: existing, error: readErr } = await supabase
+    .from("wam_outbound_idempotency")
+    .select("id,business_id,idempotency_key,phone,message_id,status,error,updated_at,sent_at")
+    .eq("business_id", businessId)
+    .eq("idempotency_key", key)
+    .maybeSingle();
+  if (readErr || !existing) {
+    throw new Error(`outbound idempotency read failed: ${readErr?.message || "missing row"}`);
+  }
+
+  if (existing.status === "sent") {
+    return { state: "sent", messageId: existing.message_id, idempotencyKey: key };
+  }
+
+  if (existing.message_id) {
+    const { data: recorded } = await supabase
+      .from("wam_messages")
+      .select("id")
+      .eq("business_id", businessId)
+      .eq("wa_message_id", existing.message_id)
+      .eq("direction", "out")
+      .limit(1)
+      .maybeSingle();
+    if (recorded?.id) {
+      await supabase.from("wam_outbound_idempotency").update({
+        status: "sent",
+        sent_at: existing.sent_at || new Date().toISOString(),
+        error: null,
+        updated_at: new Date().toISOString(),
+      }).eq("id", existing.id);
+      return { state: "sent", messageId: existing.message_id, idempotencyKey: key };
+    }
+  }
+
+  if (existing.status === "processing") {
+    const ageMs = Date.now() - new Date(existing.updated_at).getTime();
+    if (Number.isFinite(ageMs) && ageMs <= OUTBOUND_PENDING_TTL_MS) {
+      return { state: "processing", messageId: existing.message_id, idempotencyKey: key };
+    }
+    await supabase.from("wam_outbound_idempotency").update({
+      status: "uncertain",
+      error: existing.error || "stale_processing_without_delivery_receipt",
+      updated_at: new Date().toISOString(),
+    }).eq("id", existing.id);
+  }
+
+  return { state: "uncertain", messageId: existing.message_id, idempotencyKey: key };
+}
+
+async function finishOutboundIdempotency(businessId, idempotencyKey, status, messageId, error = null) {
+  if (!idempotencyKey) return;
+  const patch = {
+    status,
+    message_id: messageId || null,
+    error: error ? String(error).slice(0, 2000) : null,
+    updated_at: new Date().toISOString(),
+    sent_at: status === "sent" ? new Date().toISOString() : null,
+  };
+  await supabase.from("wam_outbound_idempotency")
+    .update(patch)
+    .eq("business_id", businessId)
+    .eq("idempotency_key", idempotencyKey);
 }
 
 const app = express();
@@ -296,7 +387,7 @@ app.post("/session/:businessId/stop", requireBridgeKey, async (req, res) => {
 });
 
 app.post("/session/:businessId/send", requireBridgeKey, async (req, res) => {
-  const { phone, text } = req.body || {};
+  const { phone, text, idempotencyKey } = req.body || {};
   if (!phone || !text) {
     return res.status(400).json({ error: "phone and text are required" });
   }
@@ -306,14 +397,69 @@ app.post("/session/:businessId/send", requireBridgeKey, async (req, res) => {
     return res.status(403).json({ error: access?.reason || "PAID_PLAN_REQUIRED" });
   }
 
+  const st = sessionManager.getState(req.params.businessId);
+  if (!st?.sock || st.status !== "connected") {
+    return res.status(409).json({ error: "WhatsApp session is not connected." });
+  }
+
+  const proposedMessageId = generateMessageIDV2(st.sock.user?.id);
+  let claim;
   try {
-    res.json({
-      ok: true,
-      messageId: await sendViaBridge(req.params.businessId, phone, { text }),
-    });
+    claim = await claimOutboundIdempotency(
+      req.params.businessId,
+      idempotencyKey,
+      phone,
+      proposedMessageId
+    );
   } catch (err) {
+    logger.error({ err }, "outbound idempotency failed");
+    return res.status(500).json({ error: "Could not secure outbound send." });
+  }
+
+  if (claim.state === "sent") {
+    return res.json({ ok: true, messageId: claim.messageId, replayed: true });
+  }
+  if (claim.state === "processing") {
+    return res.status(202).json({ ok: false, pending: true, messageId: claim.messageId });
+  }
+  if (claim.state === "uncertain") {
+    return res.status(409).json({
+      ok: false,
+      uncertain: true,
+      messageId: claim.messageId,
+      error: "Previous send outcome is uncertain; automatic resend blocked.",
+    });
+  }
+
+  try {
+    const messageId = await sendViaBridge(
+      req.params.businessId,
+      phone,
+      { text },
+      claim.messageId
+    );
+    await finishOutboundIdempotency(
+      req.params.businessId,
+      claim.idempotencyKey,
+      "sent",
+      messageId,
+      null
+    );
+    res.json({ ok: true, messageId });
+  } catch (err) {
+    await finishOutboundIdempotency(
+      req.params.businessId,
+      claim.idempotencyKey,
+      "uncertain",
+      claim.messageId,
+      err?.message || String(err)
+    );
     logger.error({ err }, "send failed");
-    res.status(409).json({ error: err.message });
+    res.status(409).json({
+      error: err?.message || String(err),
+      uncertain: !!claim.idempotencyKey,
+      messageId: claim.messageId,
+    });
   }
 });
 
