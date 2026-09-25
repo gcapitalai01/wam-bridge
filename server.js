@@ -188,12 +188,36 @@ sessionManager = createSessionManager({
   },
 });
 
-const inboundSweep = setInterval(() => {
-  inboundPipeline.sweep().catch((err) =>
-    logger.error({ err }, "WhatsApp inbound recovery sweep failed")
-  );
-}, 2000);
-inboundSweep.unref?.();
+// Adaptive, non-overlapping sweep. A plain setInterval fires every 2s
+// regardless of whether the previous call finished -- if Supabase has a
+// transient slowdown and one sweep takes >2s, the next one piles on top of
+// it, and a brief hiccup turns into a self-inflicted request storm that
+// looks like "everything is timing out". This version never starts a new
+// sweep while one is in flight, and backs off (capped) on repeated
+// failures instead of hammering an already-struggling backend.
+const SWEEP_BASE_MS = 2000;
+const SWEEP_MAX_MS = 30000;
+let sweepDelayMs = SWEEP_BASE_MS;
+let sweepInFlight = false;
+let sweepTimer = null;
+
+async function runSweepOnce() {
+  if (sweepInFlight) return; // previous sweep still running; skip this tick
+  sweepInFlight = true;
+  try {
+    await inboundPipeline.sweep();
+    sweepDelayMs = SWEEP_BASE_MS; // recovered: back to normal cadence
+  } catch (err) {
+    logger.error({ err }, "WhatsApp inbound recovery sweep failed");
+    sweepDelayMs = Math.min(sweepDelayMs * 2, SWEEP_MAX_MS);
+  } finally {
+    sweepInFlight = false;
+    sweepTimer = setTimeout(runSweepOnce, sweepDelayMs);
+    sweepTimer.unref?.();
+  }
+}
+sweepTimer = setTimeout(runSweepOnce, sweepDelayMs);
+sweepTimer.unref?.();
 
 async function sendViaBridge(businessId, phone, payload) {
   const st = sessionManager.getState(businessId);
