@@ -12,6 +12,8 @@ const LIVE_APPEND_MAX_AGE_MS = 5 * 60 * 1000;
 const CLOCK_SKEW_MS = 60 * 1000;
 const TEXTLESS_MEDIA = new Set(["audio", "image", "video", "document", "sticker"]);
 const keyStr = (k) => `${k.businessId}|${k.connectionId}|${k.chatJid}`;
+const PERSONAL_AUTOREPLY =
+  "Hola, este numero usa un asistente para clientes. Si buscas informacion de nuestros servicios, cuentame en que te ayudo. Si es un tema personal, en breve te contactan directamente.";
 
 function isFreshAppend(norm, nowMs) {
   if (!norm?.timestampMs) return false;
@@ -203,6 +205,22 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     }
 
     if (!gate.allowed) {
+      // Personal/friend/family chat, not a business inquiry: never call the
+      // AI. Send one short, static, non-AI notice so the person isn't left
+      // wondering why nobody answered, then stay silent -- no debounce, no
+      // session, no repeat replies per message.
+      if (!isMuted && gate.reason !== "SYSTEM_EVENT" && gate.reason !== "MUTED") {
+        try {
+          const notice = PERSONAL_AUTOREPLY;
+          const id = await sendRegistered(key, notice);
+          await state.recordMessage(key, {
+            direction: "out", sender: "bot", waMessageId: id, text: notice,
+            isBusinessContext: false, gateReason: gate.reason,
+          });
+        } catch (e) {
+          log.error?.({ e }, "personal auto-reply send failed (non-blocking)");
+        }
+      }
       return {
         classification: "CUSTOMER",
         decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id },
