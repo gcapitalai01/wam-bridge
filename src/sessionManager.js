@@ -1,193 +1,336 @@
-import { extractMessage, isIgnorableJid } from "./messageUtils.js";
-import { evaluateBusinessIntent } from "./businessIntentGate.js";
+// One Baileys socket per business_id per active lease owner.
+// Auth lives in Supabase so deploys/restarts can reconnect without relinking.
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  makeCacheableSignalKeyStore,
+} from "@whiskeysockets/baileys";
+import QRCode from "qrcode";
+import { useSupabaseAuthState } from "./authState.js";
 
-const PERSONAL_AUTOREPLY =
-  "Hola, este numero usa un asistente para clientes. Si buscas informacion de nuestros servicios, cuentame en que te ayudo. Si es un tema personal, en breve te contactan directamente.";
-const BUSINESS_SESSION_TTL_SECONDS = 900; // 15 min contextual continuity
-const HUMAN_MUTE_SECONDS = 300; // hard cap 5 min, matches state.muteForHuman
-
-const jidToPhone = (jid) => String(jid || "").split("@")[0].split(":")[0];
-const LIVE_APPEND_MAX_AGE_MS = 5 * 60 * 1000;
-const CLOCK_SKEW_MS = 60 * 1000;
-
-export function resolveCustomerPhone(raw, fallbackJid) {
-  const candidates = [
-    raw?.key?.remoteJidAlt,
-    raw?.key?.participantPn,
-    raw?.key?.participantAlt,
-    fallbackJid,
-  ].filter(Boolean);
-  const pn = candidates.find((jid) => String(jid).endsWith("@s.whatsapp.net"));
-  return jidToPhone(pn || candidates[0] || "");
-}
-
-function isFreshAppend(norm, now = Date.now()) {
-  if (!norm?.timestampMs) return false;
-  const age = now - norm.timestampMs;
-  return age >= -CLOCK_SKEW_MS && age <= LIVE_APPEND_MAX_AGE_MS;
-}
-
-export function createSimpleInboundHandler({
-  state,
-  forwardIncomingToAI,
-  sendRegistered,
-  log = console,
+export function createSessionManager({
+  supabase,
+  logger,
+  onMessages,
+  onClientStatus,
+  canConnect,
+  acquireLease,
+  renewLease,
+  releaseLease,
+  instanceId,
+  leaseSeconds = 45,
 }) {
-  return async function handleSimpleInbound({
-    businessId,
-    connectionId,
-    raw,
-    upsertType = "notify",
-  }) {
-    const remoteJid = raw?.key?.remoteJid || "";
-    const messageId = raw?.key?.id || null;
+  const sessions = new Map();
+  const reconnectAttempts = new Map();
+  const resumeRetryTimers = new Map();
+  const leaseRenewMs = Math.max(5000, Math.floor((leaseSeconds * 1000) / 3));
+  // Fast, capped-exponential retry for lease takeover. Starts quick (a few
+  // seconds) so a normal redeploy hands the lease back over almost instantly
+  // once the old instance's lease actually expires or it releases on
+  // shutdown, instead of waiting out one fixed ~lease-length interval.
+  // Backs off up to leaseSeconds*1000 if acquisition keeps failing, so a
+  // genuinely stuck business does not hammer the DB forever.
+  const LEASE_RETRY_FLOOR_MS = 3000;
+  const LEASE_RETRY_CEILING_MS = Math.max(LEASE_RETRY_FLOOR_MS, leaseSeconds * 1000);
+  const leaseRetryBackoff = new Map(); // businessId -> current retry delay ms
 
-    if (isIgnorableJid(remoteJid)) {
-      log.debug?.({ businessId, upsertType, remoteJid, messageId }, "WhatsApp inbound ignored by JID");
-      return { status: "JID_IGNORED" };
-    }
+  function nextLeaseRetryDelay(businessId) {
+    const current = leaseRetryBackoff.get(businessId) || LEASE_RETRY_FLOOR_MS;
+    const jitter = Math.floor(current * 0.2 * Math.random());
+    leaseRetryBackoff.set(businessId, Math.min(current * 2, LEASE_RETRY_CEILING_MS));
+    return current + jitter;
+  }
 
-    const norm = extractMessage(raw);
-    if (!norm) {
-      // Important: do NOT claim/dedupe this event. Baileys can later retry and
-      // deliver the same WhatsApp message id after Signal sessions recover.
-      log.warn?.({
-        businessId,
-        upsertType,
-        remoteJid,
-        fromMe: !!raw?.key?.fromMe,
-        messageId,
-        hasMessage: !!raw?.message,
-        messageStubType: raw?.messageStubType ?? null,
-        rawMessageKeys: raw?.message ? Object.keys(raw.message) : [],
-      }, "WhatsApp message could not be decoded; leaving unclaimed for retry");
-      return { status: "UNDECRYPTABLE_OR_UNSUPPORTED" };
-    }
+  function resetLeaseRetryDelay(businessId) {
+    leaseRetryBackoff.delete(businessId);
+  }
 
-    if (upsertType !== "notify") {
-      const allowedFreshAppend = upsertType === "append" && !norm.fromMe && isFreshAppend(norm);
-      if (!allowedFreshAppend) {
-        log.debug?.({
-          businessId,
-          upsertType,
-          chatJid: norm.chatJid,
-          messageId: norm.id,
-          fromMe: norm.fromMe,
-          timestampMs: norm.timestampMs,
-        }, "WhatsApp history append ignored");
-        return { status: "HISTORY_IGNORED" };
-      }
-    }
+  function clearResumeRetry(businessId) {
+    const timer = resumeRetryTimers.get(businessId);
+    if (timer) clearTimeout(timer);
+    resumeRetryTimers.delete(businessId);
+  }
 
-    const key = { businessId, connectionId, chatJid: norm.chatJid };
-
-    // Never answer this account's own outbound/manual messages. Also do not
-    // claim them as inbound, because the claim table is only for customer text
-    // that is eligible to reach the Brain.
-    if (norm.fromMe) {
-      const botEcho = await state.isBotOutbound(key, norm.id).catch(() => false);
-      if (!botEcho && typeof state.muteForHuman === "function") {
-        // Real human takeover: mute the AI here for up to 5 minutes so it never
-        // talks over the business owner/agent. Auto-reactivates after that.
-        await state.muteForHuman(key, HUMAN_MUTE_SECONDS).catch((e) => log.warn?.({ e }, "muteForHuman failed"));
-      }
-      return { status: botEcho ? "BOT_ECHO" : "OWNER_MESSAGE" };
-    }
-
-    const text = String(norm.text || "").trim();
-    if (!text) {
-      // Do not poison dedupe with media/system/non-text stubs. A later retry can
-      // carry a caption/text for the same id depending on Baileys decrypt state.
-      log.info?.({
-        businessId,
-        upsertType,
-        chatJid: norm.chatJid,
-        messageId: norm.id,
-        messageType: norm.messageType,
-      }, "WhatsApp inbound ignored because no text was available");
-      return { status: "NON_TEXT_IGNORED" };
-    }
-
-    // Atomic database claim happens only after the message is confirmed usable.
-    // This prevents undecryptable/system/fromMe events from blocking a later
-    // valid retry with the same WhatsApp message id.
-    const claimed = await state.claimInboundEvent(key, norm.id);
-    if (!claimed) return { status: "DUPLICATE" };
-
-    await state.recordMessage(key, {
-      direction: "in",
-      sender: "customer",
-      waMessageId: norm.id,
-      text,
-      mediaType: norm.messageType === "text" ? null : norm.messageType,
-    });
-
-    const chatState = typeof state.getChatState === "function"
-      ? await state.getChatState(key).catch(() => null)
-      : null;
-    const isMuted = !!chatState?.muted_until && new Date(chatState.muted_until).getTime() > Date.now();
-    const gate = evaluateBusinessIntent({
-      text,
-      messageType: norm.messageType,
-      isMuted,
-      businessSessionActiveUntil: chatState?.business_session_active_until || null,
-    });
-
-    if (isMuted) {
-      log.info?.({ businessId, chatJid: norm.chatJid, messageId: norm.id }, "WhatsApp inbound skipped: human is handling this chat");
-      return { status: "MUTED" };
-    }
-
-    if (!gate.allowed) {
-      // Not a customer inquiry (greeting/friend/family/off-topic). Never call
-      // the Brain for this. Send one short, static, non-AI notice instead.
-      log.info?.({ businessId, chatJid: norm.chatJid, messageId: norm.id, reason: gate.reason }, "WhatsApp inbound classified as personal, not forwarded to Brain");
+  function scheduleResumeRetry(businessId, delayMsOverride) {
+    if (resumeRetryTimers.has(businessId)) return;
+    const delayMs = delayMsOverride ?? nextLeaseRetryDelay(businessId);
+    const timer = setTimeout(async () => {
+      resumeRetryTimers.delete(businessId);
       try {
-        const outboundId = await sendRegistered(key, { text: PERSONAL_AUTOREPLY });
-        await state.recordMessage(key, { direction: "out", sender: "bot", waMessageId: outboundId, text: PERSONAL_AUTOREPLY, isBusinessContext: false, gateReason: gate.reason });
+        await startSession(businessId);
       } catch (e) {
-        log.warn?.({ e }, "personal auto-reply send failed (non-blocking)");
+        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+          logger.info({ businessId, instanceId, nextRetryMs: nextLeaseRetryDelay(businessId) }, "WhatsApp lease still owned elsewhere; retry scheduled");
+          scheduleResumeRetry(businessId);
+          return;
+        }
+        // Any other failure acquiring the lease (transient RPC error, 503,
+        // timeout) also gets a backed-off retry instead of giving up for
+        // good -- a business should never end up permanently unrecovered
+        // just because one lease check hit a network blip.
+        logger.error({ e, businessId }, "WhatsApp lease takeover attempt failed; retrying with backoff");
+        scheduleResumeRetry(businessId);
       }
-      return { status: "PERSONAL_MESSAGE" };
+    }, delayMs);
+    timer.unref?.();
+    resumeRetryTimers.set(businessId, timer);
+  }
+
+  function getState(businessId) {
+    if (!sessions.has(businessId)) {
+      sessions.set(businessId, {
+        sock: null,
+        qr: null,
+        pairingCode: null,
+        status: "disconnected",
+        phone: null,
+        connecting: false,
+        leaseTimer: null,
+        lastLeaseRenewedAt: null,
+      });
+    }
+    return sessions.get(businessId);
+  }
+
+  function clearLeaseTimer(st) {
+    if (st?.leaseTimer) clearInterval(st.leaseTimer);
+    if (st) st.leaseTimer = null;
+  }
+
+  function terminateForLeaseLoss(businessId, st, reason) {
+    clearLeaseTimer(st);
+    logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
+    try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
+    sessions.delete(businessId);
+  }
+
+  async function releaseBusinessLease(businessId, st) {
+    clearLeaseTimer(st);
+    resetLeaseRetryDelay(businessId);
+    if (releaseLease && instanceId) {
+      await releaseLease(businessId, instanceId).catch((err) =>
+        logger.warn({ err, businessId }, "lease release failed")
+      );
+    }
+  }
+
+  async function startLease(businessId, st) {
+    if (!acquireLease || !instanceId) return;
+
+    const acquired = await acquireLease(businessId, instanceId, leaseSeconds);
+    if (!acquired) {
+      throw Object.assign(new Error("SESSION_OWNED_ELSEWHERE"), {
+        code: "SESSION_OWNED_ELSEWHERE",
+      });
     }
 
-    if (gate.activateSession && typeof state.activateSession === "function") {
-      await state.activateSession(key, BUSINESS_SESSION_TTL_SECONDS, gate.reason).catch((e) => log.warn?.({ e }, "activateSession failed"));
+    resetLeaseRetryDelay(businessId);
+    clearResumeRetry(businessId);
+    st.lastLeaseRenewedAt = Date.now();
+    clearLeaseTimer(st);
+    const timer = setInterval(async () => {
+      try {
+        const ok = await renewLease?.(businessId, instanceId, leaseSeconds);
+        if (ok === false) {
+          terminateForLeaseLoss(businessId, st, "owner_changed");
+          return;
+        }
+        st.lastLeaseRenewedAt = Date.now();
+      } catch (err) {
+        logger.error({ err, businessId }, "lease renewal failed");
+        const elapsed = Date.now() - (st.lastLeaseRenewedAt || 0);
+        // Fail closed before the DB lease can expire. This prevents a second
+        // instance from acquiring the same business while this socket remains live.
+        if (elapsed >= Math.floor(leaseSeconds * 1000 * 0.66)) {
+          terminateForLeaseLoss(businessId, st, "renewal_timeout");
+        }
+      }
+    }, leaseRenewMs);
+    timer.unref?.();
+    st.leaseTimer = timer;
+  }
+
+  async function setStatus(businessId, status, extra = {}) {
+    const st = getState(businessId);
+    st.status = status;
+    if (extra.phone !== undefined) st.phone = extra.phone;
+    await onClientStatus?.(businessId, status, extra.phone ?? st.phone);
+  }
+
+  async function startSession(businessId, phoneNumberForPairing) {
+    if (canConnect) {
+      const access = await canConnect(businessId);
+      if (!access?.allowed) {
+        const reason = access?.reason || "WHATSAPP_NOT_AUTHORIZED";
+        throw Object.assign(new Error(reason), {
+          code: "WHATSAPP_NOT_AUTHORIZED",
+          accessReason: reason,
+        });
+      }
     }
 
-    const phone = resolveCustomerPhone(raw, norm.chatJid);
-    log.info?.({
-      businessId,
-      chatJid: norm.chatJid,
-      messageId: norm.id,
-      messageType: norm.messageType,
-      phone,
-      upsertType,
-      gateReason: gate.reason,
-    }, "WhatsApp inbound forwarding to Brain");
+    const st = getState(businessId);
+    if (st.connecting || (st.sock && st.status === "connected")) return st;
 
-    const data = await forwardIncomingToAI({
-      business_id: businessId,
-      connection_id: connectionId,
-      chat_jid: norm.chatJid,
-      phone,
-      message: text,
-      messages: [{ id: norm.id, type: norm.messageType, text }],
-      push_name: norm.pushName || null,
-    });
+    let leaseAcquired = false;
+    try {
+      await startLease(businessId, st);
+      leaseAcquired = true;
+      st.connecting = true;
 
-    const reply = typeof data?.reply === "string" ? data.reply.trim() : "";
-    if (!reply) {
-      log.warn?.({
-        businessId,
-        chatJid: norm.chatJid,
-        messageId: norm.id,
-        reason: data?.reason || data?.error || null,
-      }, "Brain returned no WhatsApp reply");
-      return { status: "NO_REPLY" };
+      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
+      const { version } = await fetchLatestBaileysVersion();
+      const sock = makeWASocket({
+        version,
+        auth: {
+          creds: authState.creds,
+          keys: makeCacheableSignalKeyStore(authState.keys, logger),
+        },
+        logger,
+        printQRInTerminal: false,
+        browser: Browsers.ubuntu("Chrome"),
+        markOnlineOnConnect: false,
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
+        // We do not use privacy/blocklist/business-profile init queries. They are
+        // optional in Baileys and can time out/reconnect long-lived headless sockets.
+        fireInitQueries: false,
+        getMessage: async () => undefined,
+      });
+
+      st.sock = sock;
+      st.status = "connecting";
+
+      if (phoneNumberForPairing && !authState.creds.registered) {
+        try {
+          st.pairingCode = await sock.requestPairingCode(
+            phoneNumberForPairing.replace(/[^0-9]/g, "")
+          );
+          st.status = "pairing_pending";
+          await setStatus(businessId, "pairing_pending");
+        } catch (err) {
+          logger.error({ err }, "requestPairingCode failed — falling back to QR");
+        }
+      }
+
+      sock.ev.on("creds.update", saveCreds);
+
+      sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+          st.qr = await QRCode.toDataURL(qr);
+          if (st.status !== "pairing_pending" && !st.pairingCode) {
+            await setStatus(businessId, "qr_pending");
+          }
+        }
+
+        if (connection === "open") {
+          st.qr = null;
+          st.pairingCode = null;
+          st.connecting = false;
+          reconnectAttempts.delete(businessId);
+          await setStatus(businessId, "connected", {
+            phone: sock.user?.id ? jidNormalizedUser(sock.user.id).split("@")[0] : null,
+          });
+        }
+
+        if (connection === "close") {
+          st.connecting = false;
+          clearLeaseTimer(st);
+
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          const loggedOut =
+            statusCode === DisconnectReason.loggedOut || statusCode === 401;
+
+          if (loggedOut) {
+            await setStatus(businessId, "disconnected");
+            await clearAll();
+            await releaseBusinessLease(businessId, st);
+            sessions.delete(businessId);
+            reconnectAttempts.delete(businessId);
+          } else {
+            await setStatus(businessId, "reconnecting");
+            const attempt = (reconnectAttempts.get(businessId) || 0) + 1;
+            reconnectAttempts.set(businessId, attempt);
+            const delay = Math.min(3000 * Math.pow(2, attempt - 1), 60000);
+            sessions.delete(businessId);
+            setTimeout(() => {
+              startSession(businessId).catch((e) => {
+                if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+                  scheduleResumeRetry(businessId);
+                  return;
+                }
+                logger.error({ e, businessId }, "reconnect failed");
+              });
+            }, delay).unref?.();
+          }
+        }
+      });
+
+      sock.ev.on("messages.upsert", async (payload) => {
+        try {
+          await onMessages?.(businessId, sock, payload);
+        } catch (err) {
+          logger.error({ err }, "onMessages handler failed");
+        }
+      });
+
+      return st;
+    } catch (err) {
+      st.connecting = false;
+      if (leaseAcquired) await releaseBusinessLease(businessId, st);
+      throw err;
+    }
+  }
+
+  async function stopSession(businessId) {
+    const st = getState(businessId);
+    clearResumeRetry(businessId);
+    clearLeaseTimer(st);
+    if (st.sock) {
+      try { await st.sock.logout(); } catch (_) {}
+    }
+    await releaseBusinessLease(businessId, st);
+    sessions.delete(businessId);
+    await onClientStatus?.(businessId, "disconnected", st.phone);
+  }
+
+  async function resumeAll() {
+    const { data, error } = await supabase
+      .from("wam_clients")
+      .select("business_id, status")
+      .in("status", ["connected", "connecting", "reconnecting", "pairing_pending", "qr_pending"]);
+
+    if (error) {
+      logger.error({ error }, "resumeAll query failed");
+      return;
     }
 
-    const outboundId = await sendRegistered(key, { text: reply });
-    return { status: "SENT", inboundId: norm.id, outboundId };
-  };
+    for (const row of data || []) {
+      startSession(row.business_id).catch((e) => {
+        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+          scheduleResumeRetry(row.business_id);
+          return;
+        }
+        logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
+      });
+    }
+  }
+
+  async function shutdownAll() {
+    for (const timer of resumeRetryTimers.values()) clearTimeout(timer);
+    resumeRetryTimers.clear();
+    const entries = [...sessions.entries()];
+    for (const [businessId, st] of entries) {
+      clearLeaseTimer(st);
+      try { st.sock?.end?.(new Error("bridge shutdown")); } catch (_) {}
+      await releaseBusinessLease(businessId, st);
+    }
+    sessions.clear();
+  }
+
+  return { getState, startSession, stopSession, resumeAll, shutdownAll, sessions };
 }
