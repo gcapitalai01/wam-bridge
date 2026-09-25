@@ -36,6 +36,22 @@ if (startupErrors.length) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// Crash safety net. Baileys' internal retry/relay machinery is known to
+// occasionally throw an unhandled Boom error deep inside a mutex-wrapped
+// promise (e.g. a "Connection Closed"/precondition-required error while
+// retrying a message send). Left unhandled, that kills the ENTIRE Node
+// process -- dropping every connected business's WhatsApp socket on this
+// instance at once, not just the one that hit the glitch, and forcing a
+// fresh multi-second lease takeover for all of them. Logging and staying
+// alive is strictly safer here: each business's own session/reconnect
+// logic already handles its own recovery independently.
+process.on("uncaughtException", (err) => {
+  logger.error({ err }, "uncaughtException: process kept alive");
+});
+process.on("unhandledRejection", (reason) => {
+  logger.error({ reason }, "unhandledRejection: process kept alive");
+});
 const checkWhatsAppAccess = createWhatsAppAccessControl(supabase, logger);
 const checkWhatsAppAccessCached = createCachedAccessCheck(checkWhatsAppAccess, 60000);
 const state = createState(supabase, logger);
