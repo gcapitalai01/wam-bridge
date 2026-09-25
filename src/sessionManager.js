@@ -61,17 +61,20 @@ export function createSessionManager({
       try {
         await startSession(businessId);
       } catch (e) {
+        // Compute the NEXT delay exactly once per failed attempt and reuse
+        // it for both the log line and the actual timer -- calling the
+        // backoff generator twice here was doubling the growth rate.
+        const retryDelayMs = nextLeaseRetryDelay(businessId);
         if (e?.code === "SESSION_OWNED_ELSEWHERE") {
-          logger.info({ businessId, instanceId, nextRetryMs: nextLeaseRetryDelay(businessId) }, "WhatsApp lease still owned elsewhere; retry scheduled");
-          scheduleResumeRetry(businessId);
-          return;
+          logger.info({ businessId, instanceId, retryDelayMs }, "WhatsApp lease still owned elsewhere; retry scheduled");
+        } else {
+          // Any other failure acquiring the lease (transient RPC error, 503,
+          // timeout) also gets a backed-off retry instead of giving up for
+          // good -- a business should never end up permanently unrecovered
+          // just because one lease check hit a network blip.
+          logger.error({ e, businessId, retryDelayMs }, "WhatsApp lease takeover attempt failed; retrying with backoff");
         }
-        // Any other failure acquiring the lease (transient RPC error, 503,
-        // timeout) also gets a backed-off retry instead of giving up for
-        // good -- a business should never end up permanently unrecovered
-        // just because one lease check hit a network blip.
-        logger.error({ e, businessId }, "WhatsApp lease takeover attempt failed; retrying with backoff");
-        scheduleResumeRetry(businessId);
+        scheduleResumeRetry(businessId, retryDelayMs);
       }
     }, delayMs);
     timer.unref?.();
