@@ -4,7 +4,6 @@
 // 9 update session state -> 10 start/reset debounce -> 11 re-read state -> 12 AI ->
 // 13 re-read state -> 14 send in customer language -> 15 register outbound id.
 import { extractMessage, isIgnorableJid } from "./messageUtils.js";
-import { evaluateBusinessIntent } from "./businessIntentGate.js";
 import { detectCustomerLanguage } from "./languageDetector.js";
 
 const HUMAN_FROM_ME_MAX_AGE_MS = 2 * 60 * 1000;
@@ -12,8 +11,6 @@ const LIVE_APPEND_MAX_AGE_MS = 5 * 60 * 1000;
 const CLOCK_SKEW_MS = 60 * 1000;
 const TEXTLESS_MEDIA = new Set(["audio", "image", "video", "document", "sticker"]);
 const keyStr = (k) => `${k.businessId}|${k.connectionId}|${k.chatJid}`;
-const PERSONAL_AUTOREPLY =
-  "Hola, este numero usa un asistente para clientes. Si buscas informacion de nuestros servicios, cuentame en que te ayudo. Si es un tema personal, en breve te contactan directamente.";
 
 function isFreshAppend(norm, nowMs) {
   if (!norm?.timestampMs) return false;
@@ -177,63 +174,33 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       await state.persistLanguage(key, lang);
     }
 
-    const gate = evaluateBusinessIntent({
-      text: norm.text,
-      messageType: norm.messageType,
-      isSystemEvent: norm.messageType === "system",
-      isMuted,
-      businessSessionActiveUntil: chatState?.business_session_active_until || null,
-      now: new Date(now()),
-      quotedContext: quotedContext ? {
-        verified: quotedContext.verified,
-        isBusinessContext: quotedContext.isBusinessContext,
-      } : null,
-      tenantKeywords: settings.tenantKeywords,
-      industryKeywords: settings.industryKeywords,
-      mediaIntent: null,
+    if (norm.messageType === "system") return { classification: "IGNORED" };
+
+    // No business/personal gate: every real inbound message (except a
+    // human-mute window) goes straight to the AI, like Wasenger/RespondIO/
+    // GoHighLevel. What the AI says for greetings/FAQs/off-topic messages is
+    // controlled entirely by the system prompt on the Brain side, not by
+    // blocking anything here.
+    await state.recordMessage(key, {
+      direction: "in", sender: "customer", waMessageId: norm.id, text: norm.text,
+      mediaType: TEXTLESS_MEDIA.has(norm.messageType) ? norm.messageType : null,
+      isBusinessContext: true, gateReason: "NO_GATE",
+      detectedLanguage: lang.language, languageConfidence: lang.confidence, languageSource: lang.source,
+      quotedWaMessageId: quotedContext?.waMessageId || null,
+      quotedIsBusinessContext: quotedContext?.isBusinessContext ?? null,
     });
 
-    if (norm.messageType !== "system") {
-      await state.recordMessage(key, {
-        direction: "in", sender: "customer", waMessageId: norm.id, text: norm.text,
-        mediaType: TEXTLESS_MEDIA.has(norm.messageType) ? norm.messageType : null,
-        isBusinessContext: gate.allowed, gateReason: gate.reason,
-        detectedLanguage: lang.language, languageConfidence: lang.confidence, languageSource: lang.source,
-        quotedWaMessageId: quotedContext?.waMessageId || null,
-        quotedIsBusinessContext: quotedContext?.isBusinessContext ?? null,
-      });
-    }
-
-    if (!gate.allowed) {
-      // Personal/friend/family chat, not a business inquiry: never call the
-      // AI. Send one short, static, non-AI notice so the person isn't left
-      // wondering why nobody answered, then stay silent -- no debounce, no
-      // session, no repeat replies per message.
-      if (!isMuted && gate.reason !== "SYSTEM_EVENT" && gate.reason !== "MUTED") {
-        try {
-          const notice = PERSONAL_AUTOREPLY;
-          const id = await sendRegistered(key, notice);
-          await state.recordMessage(key, {
-            direction: "out", sender: "bot", waMessageId: id, text: notice,
-            isBusinessContext: false, gateReason: gate.reason,
-          });
-        } catch (e) {
-          log.error?.({ e }, "personal auto-reply send failed (non-blocking)");
-        }
-      }
-      return {
-        classification: "CUSTOMER",
-        decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id },
-      };
+    if (isMuted) {
+      return { classification: "CUSTOMER", decision: { allowed: false, reason: "MUTED", businessId, chatJid: norm.chatJid, messageId: norm.id } };
     }
 
     const item = {
       id: norm.id, type: norm.messageType, text: norm.text, language: lang.language,
-      reason: gate.reason, pushName: norm.pushName || null,
+      reason: "NO_GATE", pushName: norm.pushName || null,
     };
     const q = await state.enqueue(key, item, {
-      activate: gate.activateSession,
-      reason: gate.reason,
+      activate: true,
+      reason: "NO_GATE",
       ttlSeconds: settings.business_session_ttl_seconds,
       debounceMs: settings.debounce_seconds * 1000,
     });
@@ -244,7 +211,7 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
     schedule(key, q.debounceVersion, q.dueAt);
     return {
       classification: "CUSTOMER",
-      decision: { ...gate, businessId, chatJid: norm.chatJid, messageId: norm.id },
+      decision: { allowed: true, reason: "NO_GATE", businessId, chatJid: norm.chatJid, messageId: norm.id },
     };
   }
 
