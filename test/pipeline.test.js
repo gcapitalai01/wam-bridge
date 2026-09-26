@@ -77,15 +77,16 @@ function raw(text, { id = "M1", fromMe = false, type = "conversation" } = {}) {
   return { key: { remoteJid: "5215500000000@s.whatsapp.net", id, fromMe }, message, messageTimestamp: Math.floor(Date.now() / 1000), pushName: "Test" };
 }
 
-test("Personal/small-talk message: STOP COMPLETELY — no debounce, no AI, no reply", async () => {
+test("Personal/small-talk message enters NO_GATE debounce; Brain decides the reply", async () => {
   const state = fakeState();
   let aiCalls = 0, sent = 0;
   const pipeline = createPipeline({ state, ai: async () => { aiCalls++; return "x"; }, send: { prepareId: async () => "id", deliver: async () => { sent++; } } });
   const r = await pipeline.handle(raw("hey how are you"), { businessId: "b1", connectionId: "c1" });
-  assert.equal(r.decision.allowed, false);
+  assert.equal(r.decision.allowed, true);
+  assert.equal(r.decision.reason, "NO_GATE");
   const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
-  assert.equal(row?.business_session_active_until, undefined); // no session opened
-  assert.equal(row?.pending_batch, undefined);                  // no debounce entry
+  assert.ok(row?.business_session_active_until);
+  assert.equal(row?.pending_batch?.length, 1);
   assert.equal(aiCalls, 0);
   assert.equal(sent, 0);
 });
@@ -157,21 +158,24 @@ test("Full flush: reply carries the detected language and registers outbound id 
   assert.ok(state.outbound.has("OUT_ID_1"));
 });
 
-test("Photo without verified business quote => STOP COMPLETELY (UNSUPPORTED_MEDIA)", async () => {
+test("Photo without verified quote follows current NO_GATE ingestion contract", async () => {
   const state = fakeState();
   let aiCalls = 0;
   const pipeline = createPipeline({ state, ai: async () => { aiCalls++; return "x"; }, send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = await pipeline.handle(raw("", { type: "image" }), { businessId: "b1", connectionId: "c1" });
-  assert.equal(r.decision.allowed, false);
-  assert.equal(r.decision.reason, "UNSUPPORTED_MEDIA");
+  assert.equal(r.decision.allowed, true);
+  assert.equal(r.decision.reason, "NO_GATE");
+  const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
+  assert.equal(row?.pending_batch?.length, 1);
   assert.equal(aiCalls, 0);
 });
 
-test("Sticker => STOP COMPLETELY", async () => {
+test("Sticker follows current NO_GATE ingestion contract", async () => {
   const state = fakeState();
   const pipeline = createPipeline({ state, ai: async () => "x", send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = await pipeline.handle(raw("", { type: "sticker" }), { businessId: "b1", connectionId: "c1" });
-  assert.equal(r.decision.allowed, false);
+  assert.equal(r.decision.allowed, true);
+  assert.equal(r.decision.reason, "NO_GATE");
 });
 
 test("Active business session + bare contextual reply (\"3pm\") continues", async () => {
@@ -180,15 +184,16 @@ test("Active business session + bare contextual reply (\"3pm\") continues", asyn
   const pipeline = createPipeline({ state, ai: async () => "ok", send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = await pipeline.handle(raw("3pm"), { businessId: "b1", connectionId: "c1" });
   assert.equal(r.decision.allowed, true);
-  assert.equal(r.decision.reason, "ACTIVE_BUSINESS_SESSION");
+  assert.equal(r.decision.reason, "NO_GATE");
 });
 
-test("Active business session does NOT mean reply to everything (random small talk still stops)", async () => {
+test("Active business session still uses NO_GATE for random small talk", async () => {
   const state = fakeState();
   state.chats.set("b1|c1|5215500000000@s.whatsapp.net", { business_session_active_until: new Date(Date.now() + 60000).toISOString(), pending_batch: [] });
   const pipeline = createPipeline({ state, ai: async () => "ok", send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = await pipeline.handle(raw("hey how are you"), { businessId: "b1", connectionId: "c1" });
-  assert.equal(r.decision.allowed, false);
+  assert.equal(r.decision.allowed, true);
+  assert.equal(r.decision.reason, "NO_GATE");
 });
 
 test("Message while muted => STOP COMPLETELY even with a business keyword", async () => {
@@ -211,7 +216,7 @@ test("English business message => allowed, session in English, then '3pm' stays 
   await pipeline.flush(key, row1.debounceVersion);
   const r2 = await pipeline.handle(raw("3pm", { id: "EN2" }), opts);
   assert.equal(r2.decision.allowed, true);
-  assert.equal(r2.decision.reason, "ACTIVE_BUSINESS_SESSION");
+  assert.equal(r2.decision.reason, "NO_GATE");
 });
 
 test("Spanish business message => session in Spanish, later '3pm' keeps business context and Spanish session language", async () => {
@@ -229,7 +234,7 @@ test("Spanish business message => session in Spanish, later '3pm' keeps business
   // session-language fallback path as a bare "3pm" would, deterministically.
   const r2 = await pipeline.handle(raw("mañana", { id: "ES2" }), opts);
   assert.equal(r2.decision.allowed, true);
-  assert.equal(r2.decision.reason, "ACTIVE_BUSINESS_SESSION");
+  assert.equal(r2.decision.reason, "NO_GATE");
   const row2 = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
   await pipeline.flush(key, row2.debounceVersion);
   // The session language stays Spanish across turns.
@@ -327,13 +332,15 @@ test("Fresh direct append keeps the full business-intent gate and can enter debo
   assert.equal(row.pending_batch.length, 1);
 });
 
-test("Fresh personal append is still blocked before AI/debounce", async () => {
+test("Fresh personal append enters NO_GATE debounce without immediate AI call", async () => {
   const state = fakeState();
   let aiCalls = 0;
   const pipeline = createPipeline({ state, ai: async () => { aiCalls++; return "reply"; }, send: { prepareId: async () => "id", deliver: async () => {} } });
   const r = raw("hola", { id: "APPEND-PERSONAL" });
   const result = await pipeline.handle(r, { businessId: "b1", connectionId: "c1", upsertType: "append" });
-  assert.equal(result.decision.allowed, false);
-  assert.equal(result.decision.reason, "PERSONAL_MESSAGE");
+  assert.equal(result.decision.allowed, true);
+  assert.equal(result.decision.reason, "NO_GATE");
+  const row = state.chats.get("b1|c1|5215500000000@s.whatsapp.net");
+  assert.equal(row?.pending_batch?.length, 1);
   assert.equal(aiCalls, 0);
 });
