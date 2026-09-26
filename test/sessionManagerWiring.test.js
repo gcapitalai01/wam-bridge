@@ -16,3 +16,14 @@ test("production socket disables optional Baileys init queries", async () => {
   const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
   assert.match(source, /fireInitQueries:\s*false/);
 });
+
+
+test("bulk session resume is bounded and Baileys version lookup is cached per process", async () => {
+  const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
+  assert.match(source, /const RESUME_CONCURRENCY = 5/);
+  assert.match(source, /const RESUME_STAGGER_MS = 250/);
+  assert.match(source, /let baileysVersionPromise = null/);
+  assert.match(source, /const version = await getBaileysVersion\(\)/);
+  assert.match(source, /const workerCount = Math\.min\(RESUME_CONCURRENCY, rows\.length\)/);
+  assert.match(source, /await Promise\.all\(Array\.from\(\{ length: workerCount \}, \(\) => resumeWorker\(\)\)\)/);
+});

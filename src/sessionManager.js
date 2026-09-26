@@ -35,6 +35,21 @@ export function createSessionManager({
   const LEASE_RETRY_FLOOR_MS = 3000;
   const LEASE_RETRY_CEILING_MS = Math.max(LEASE_RETRY_FLOOR_MS, leaseSeconds * 1000);
   const leaseRetryBackoff = new Map(); // businessId -> current retry delay ms
+  const RESUME_CONCURRENCY = 5;
+  const RESUME_STAGGER_MS = 250;
+  let baileysVersionPromise = null;
+
+  async function getBaileysVersion() {
+    if (!baileysVersionPromise) {
+      baileysVersionPromise = fetchLatestBaileysVersion()
+        .then(({ version }) => version)
+        .catch((err) => {
+          baileysVersionPromise = null;
+          throw err;
+        });
+    }
+    return baileysVersionPromise;
+  }
 
   function nextLeaseRetryDelay(businessId) {
     const current = leaseRetryBackoff.get(businessId) || LEASE_RETRY_FLOOR_MS;
@@ -193,7 +208,7 @@ export function createSessionManager({
       st.connecting = true;
 
       const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
-      const { version } = await fetchLatestBaileysVersion();
+      const version = await getBaileysVersion();
       const sock = makeWASocket({
         version,
         auth: {
@@ -321,15 +336,35 @@ export function createSessionManager({
       return;
     }
 
-    for (const row of data || []) {
-      startSession(row.business_id).catch((e) => {
-        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
-          scheduleResumeRetry(row.business_id);
-          return;
+    const rows = data || [];
+    let cursor = 0;
+
+    async function resumeWorker() {
+      while (true) {
+        const index = cursor++;
+        if (index >= rows.length) return;
+        const row = rows[index];
+
+        try {
+          await startSession(row.business_id);
+        } catch (e) {
+          if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+            scheduleResumeRetry(row.business_id);
+          } else {
+            logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
+          }
         }
-        logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
-      });
+
+        // Avoid a restart thundering-herd against WhatsApp/Supabase when many
+        // businesses are restored after a deploy or instance recycle.
+        if (cursor < rows.length) {
+          await new Promise((resolve) => setTimeout(resolve, RESUME_STAGGER_MS));
+        }
+      }
     }
+
+    const workerCount = Math.min(RESUME_CONCURRENCY, rows.length);
+    await Promise.all(Array.from({ length: workerCount }, () => resumeWorker()));
   }
 
   async function shutdownAll() {
