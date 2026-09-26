@@ -197,6 +197,7 @@ sessionManager = createSessionManager({
 // failures instead of hammering an already-struggling backend.
 const SWEEP_BASE_MS = 2000;
 const SWEEP_MAX_MS = 30000;
+const SWEEP_IDLE_MAX_MS = 30000;
 let sweepDelayMs = SWEEP_BASE_MS;
 let sweepInFlight = false;
 let sweepTimer = null;
@@ -205,8 +206,14 @@ async function runSweepOnce() {
   if (sweepInFlight) return; // previous sweep still running; skip this tick
   sweepInFlight = true;
   try {
-    await inboundPipeline.sweep();
-    sweepDelayMs = SWEEP_BASE_MS; // recovered: back to normal cadence
+    const activity = await inboundPipeline.sweep();
+    // Live inbound messages use their own local debounce timer, so the DB sweep
+    // is recovery-only. When recovery finds nothing, back off instead of
+    // polling Supabase every 2 seconds forever. Any due recovery work resets
+    // immediately to the fast cadence.
+    sweepDelayMs = activity?.due > 0
+      ? SWEEP_BASE_MS
+      : Math.min(Math.max(sweepDelayMs * 2, SWEEP_BASE_MS), SWEEP_IDLE_MAX_MS);
   } catch (err) {
     logger.error({ err }, "WhatsApp inbound recovery sweep failed");
     sweepDelayMs = Math.min(sweepDelayMs * 2, SWEEP_MAX_MS);
