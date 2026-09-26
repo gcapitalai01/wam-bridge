@@ -217,13 +217,16 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
 
   async function sweep(ownedBusinessIds) {
     const rows = await state.dueBatches(50);
+    let processed = 0;
     for (const r of rows) {
       if (ownedBusinessIds && !ownedBusinessIds.has(r.business_id)) continue;
       const key = { businessId: r.business_id, connectionId: r.connection_id, chatJid: r.chat_jid };
       if (timers.has(keyStr(key))) continue;
       await flush(key, Number(r.debounce_version))
         .catch((e) => log.error?.({ e }, "sweep flush failed"));
+      processed += 1;
     }
+    return { due: rows.length, processed };
   }
 
   return { handle, flush, sweep, sendRegistered };
