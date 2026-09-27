@@ -23,7 +23,7 @@ async function withAuthLock(businessId, fn) {
   }
 }
 
-export async function useSupabaseAuthState(supabase, businessId, ownerInstance) {
+export async function useSupabaseAuthState(supabase, businessId) {
   const table = "wam_auth_state";
 
   const encode = (value) =>
@@ -44,29 +44,30 @@ export async function useSupabaseAuthState(supabase, businessId, ownerInstance) 
     return data ? decode(data.value) : null;
   }
 
-  async function fencedWrite(key, value, remove = false) {
-    // DB-enforced lease fence: a draining/old Render instance may still have
-    // Signal operations in flight after socket shutdown, but it must never be
-    // allowed to overwrite auth state once ownership moved to another instance.
-    const { data, error } = await supabase.rpc("wa_auth_write_if_owner", {
-      p_business: businessId,
-      p_owner_instance: ownerInstance,
-      p_data_key: key,
-      p_value: remove ? null : encode(value),
-      p_delete: remove,
-    });
-    if (error) throw new Error(`wam_auth_state fenced write: ${error.message}`);
-    if (data !== true) {
-      throw Object.assign(new Error("AUTH_WRITE_LEASE_LOST"), { code: "AUTH_WRITE_LEASE_LOST" });
-    }
-  }
-
   async function writeData(key, value) {
-    return fencedWrite(key, value, false);
+    const { error } = await supabase
+      .from(table)
+      .upsert(
+        {
+          business_id: businessId,
+          data_key: key,
+          value: encode(value),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "business_id,data_key" }
+      );
+
+    if (error) throw new Error(`wam_auth_state write: ${error.message}`);
   }
 
   async function removeData(key) {
-    return fencedWrite(key, null, true);
+    const { error } = await supabase
+      .from(table)
+      .delete()
+      .eq("business_id", businessId)
+      .eq("data_key", key);
+
+    if (error) throw new Error(`wam_auth_state delete: ${error.message}`);
   }
 
   const creds = (await withAuthLock(businessId, () => readData("creds"))) || initAuthCreds();
