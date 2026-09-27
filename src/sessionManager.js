@@ -207,7 +207,7 @@ export function createSessionManager({
       leaseAcquired = true;
       st.connecting = true;
 
-      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId);
+      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId, instanceId);
       const version = await getBaileysVersion();
       const sock = makeWASocket({
         version,
