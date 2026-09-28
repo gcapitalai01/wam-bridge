@@ -4,11 +4,15 @@ import { useSupabaseAuthState } from "../src/authState.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function fakeSupabase({ upsertDelayForMarker = {} } = {}) {
+function fakeSupabase({ writeDelayForMarker = {} } = {}) {
   const rows = new Map();
+  const owners = new Map();
 
   return {
     rows,
+    setOwner(businessId, owner) {
+      owners.set(businessId, owner);
+    },
     from(table) {
       assert.equal(table, "wam_auth_state");
       return {
@@ -22,49 +26,46 @@ function fakeSupabase({ upsertDelayForMarker = {} } = {}) {
             },
           };
         },
-        async upsert(row) {
-          const marker = row?.value?.marker;
-          const delay = upsertDelayForMarker[marker] || 0;
-          if (delay) await sleep(delay);
-          rows.set(`${row.business_id}|${row.data_key}`, row);
-          return { error: null };
-        },
-        delete() {
-          const filters = {};
-          return {
-            eq(col, value) {
-              filters[col] = value;
-              // Final eq in removeData executes through await on this thenable.
-              return this;
-            },
-            then(resolve) {
-              if (filters.data_key) {
-                rows.delete(`${filters.business_id}|${filters.data_key}`);
-              } else {
-                for (const key of [...rows.keys()]) {
-                  if (key.startsWith(`${filters.business_id}|`)) rows.delete(key);
-                }
-              }
-              return Promise.resolve({ error: null }).then(resolve);
-            },
-          };
-        },
       };
+    },
+    async rpc(fn, args) {
+      const currentOwner = owners.get(args.p_business);
+      if (currentOwner !== args.p_owner_instance) return { data: false, error: null };
+
+      if (fn === "wa_auth_write_if_owner") {
+        const marker = args.p_value?.marker;
+        const delay = writeDelayForMarker[marker] || 0;
+        if (delay) await sleep(delay);
+        const key = `${args.p_business}|${args.p_data_key}`;
+        if (args.p_delete) rows.delete(key);
+        else rows.set(key, { value: args.p_value });
+        return { data: true, error: null };
+      }
+
+      if (fn === "wa_auth_clear_if_owner") {
+        for (const key of [...rows.keys()]) {
+          if (key.startsWith(`${args.p_business}|`)) rows.delete(key);
+        }
+        return { data: true, error: null };
+      }
+
+      return { data: null, error: { message: `unexpected rpc ${fn}` } };
     },
   };
 }
 
-test("Supabase auth store persists and reloads Signal keys", async () => {
+test("Supabase auth store persists and reloads Signal keys under active owner", async () => {
   const db = fakeSupabase();
-  const first = await useSupabaseAuthState(db, "business-1");
+  db.setOwner("business-1", "instance-a:session-1");
 
+  const first = await useSupabaseAuthState(db, "business-1", "instance-a:session-1");
   await first.state.keys.set({
     session: { alice: { marker: 7 } },
     "app-state-sync-version": { main: { version: 3 } },
   });
   await first.saveCreds();
 
-  const second = await useSupabaseAuthState(db, "business-1");
+  const second = await useSupabaseAuthState(db, "business-1", "instance-a:session-1");
   const got = await second.state.keys.get("session", ["alice"]);
 
   assert.equal(got.alice.marker, 7);
@@ -72,8 +73,9 @@ test("Supabase auth store persists and reloads Signal keys", async () => {
 });
 
 test("Signal key writes are serialized so stale slow writes cannot win", async () => {
-  const db = fakeSupabase({ upsertDelayForMarker: { 1: 30, 2: 0 } });
-  const store = await useSupabaseAuthState(db, "business-1");
+  const db = fakeSupabase({ writeDelayForMarker: { 1: 30, 2: 0 } });
+  db.setOwner("business-1", "instance-a:session-1");
+  const store = await useSupabaseAuthState(db, "business-1", "instance-a:session-1");
 
   const slow = store.state.keys.set({ session: { alice: { marker: 1 } } });
   await sleep(5);
@@ -85,15 +87,40 @@ test("Signal key writes are serialized so stale slow writes cannot win", async (
   assert.equal(got.alice.marker, 2);
 });
 
-test("clearAll removes only this business auth state", async () => {
+test("stale session generation cannot overwrite a replacement socket", async () => {
   const db = fakeSupabase();
-  const one = await useSupabaseAuthState(db, "business-1");
-  const two = await useSupabaseAuthState(db, "business-2");
+  db.setOwner("business-1", "instance-a:session-old");
 
-  await one.state.keys.set({ session: { a: { x: 1 } } });
-  await two.state.keys.set({ session: { b: { x: 2 } } });
-  await one.clearAll();
+  const oldStore = await useSupabaseAuthState(db, "business-1", "instance-a:session-old");
+  await oldStore.state.keys.set({ session: { alice: { marker: 1 } } });
 
-  assert.equal([...db.rows.keys()].some((k) => k.startsWith("business-1|")), false);
-  assert.equal([...db.rows.keys()].some((k) => k.startsWith("business-2|")), true);
+  db.setOwner("business-1", "instance-a:session-new");
+  const newStore = await useSupabaseAuthState(db, "business-1", "instance-a:session-new");
+  await newStore.state.keys.set({ session: { alice: { marker: 2 } } });
+
+  await assert.rejects(
+    oldStore.state.keys.set({ session: { alice: { marker: 3 } } }),
+    (err) => err?.code === "AUTH_WRITE_LEASE_LOST"
+  );
+
+  const got = await newStore.state.keys.get("session", ["alice"]);
+  assert.equal(got.alice.marker, 2);
+});
+
+test("clearAll is fenced and cannot erase auth owned by a newer session", async () => {
+  const db = fakeSupabase();
+  db.setOwner("business-1", "instance-a:session-old");
+  const oldStore = await useSupabaseAuthState(db, "business-1", "instance-a:session-old");
+  await oldStore.state.keys.set({ session: { alice: { marker: 1 } } });
+
+  db.setOwner("business-1", "instance-a:session-new");
+  const newStore = await useSupabaseAuthState(db, "business-1", "instance-a:session-new");
+  await newStore.state.keys.set({ session: { bob: { marker: 2 } } });
+
+  await assert.rejects(
+    oldStore.clearAll(),
+    (err) => err?.code === "AUTH_WRITE_LEASE_LOST"
+  );
+
+  assert.equal(db.rows.has("business-1|session-bob"), true);
 });

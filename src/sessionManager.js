@@ -1,5 +1,6 @@
 // One Baileys socket per business_id per active lease owner.
 // Auth lives in Supabase so deploys/restarts can reconnect without relinking.
+import { randomUUID } from "node:crypto";
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -107,6 +108,7 @@ export function createSessionManager({
         connecting: false,
         leaseTimer: null,
         lastLeaseRenewedAt: null,
+        leaseOwner: null,
       });
     }
     return sessions.get(businessId);
@@ -121,23 +123,29 @@ export function createSessionManager({
     clearLeaseTimer(st);
     logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
     try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
-    sessions.delete(businessId);
+    if (sessions.get(businessId) === st) sessions.delete(businessId);
+    scheduleResumeRetry(businessId);
   }
 
   async function releaseBusinessLease(businessId, st) {
     clearLeaseTimer(st);
     resetLeaseRetryDelay(businessId);
-    if (releaseLease && instanceId) {
-      await releaseLease(businessId, instanceId).catch((err) =>
+    const leaseOwner = st?.leaseOwner;
+    if (releaseLease && leaseOwner) {
+      await releaseLease(businessId, leaseOwner).catch((err) =>
         logger.warn({ err, businessId }, "lease release failed")
       );
     }
+    if (st) st.leaseOwner = null;
   }
 
   async function startLease(businessId, st) {
     if (!acquireLease || !instanceId) return;
 
-    const acquired = await acquireLease(businessId, instanceId, leaseSeconds);
+    if (!st.leaseOwner) st.leaseOwner = `${instanceId}:${randomUUID()}`;
+    const leaseOwner = st.leaseOwner;
+
+    const acquired = await acquireLease(businessId, leaseOwner, leaseSeconds);
     if (!acquired) {
       throw Object.assign(new Error("SESSION_OWNED_ELSEWHERE"), {
         code: "SESSION_OWNED_ELSEWHERE",
@@ -157,7 +165,7 @@ export function createSessionManager({
       if (renewInFlight) return;
       renewInFlight = true;
       try {
-        const ok = await renewLease?.(businessId, instanceId, leaseSeconds);
+        const ok = await renewLease?.(businessId, leaseOwner, leaseSeconds);
         if (ok === false) {
           terminateForLeaseLoss(businessId, st, "owner_changed");
           return;
@@ -207,7 +215,7 @@ export function createSessionManager({
       leaseAcquired = true;
       st.connecting = true;
 
-      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId, instanceId);
+      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId, st.leaseOwner);
       const version = await getBaileysVersion();
       const sock = makeWASocket({
         version,
@@ -242,9 +250,22 @@ export function createSessionManager({
         }
       }
 
-      sock.ev.on("creds.update", saveCreds);
+      sock.ev.on("creds.update", () => {
+        saveCreds().catch((err) => {
+          if (err?.code === "AUTH_WRITE_LEASE_LOST") {
+            logger.warn({ businessId }, "ignored stale creds.update after lease handoff");
+            return;
+          }
+          logger.error({ err, businessId }, "creds.update persistence failed");
+        });
+      });
 
       sock.ev.on("connection.update", async (update) => {
+        if (sessions.get(businessId) !== st || st.sock !== sock) {
+          logger.debug?.({ businessId }, "ignored stale socket connection update");
+          return;
+        }
+
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -274,16 +295,31 @@ export function createSessionManager({
 
           if (loggedOut) {
             await setStatus(businessId, "disconnected");
-            await clearAll();
+            try {
+              await clearAll();
+            } catch (err) {
+              if (err?.code === "AUTH_WRITE_LEASE_LOST") {
+                logger.warn({ businessId }, "skipped auth clear after lease handoff");
+              } else {
+                logger.error({ err, businessId }, "failed to clear logged-out auth state");
+              }
+            }
             await releaseBusinessLease(businessId, st);
-            sessions.delete(businessId);
+            if (sessions.get(businessId) === st) sessions.delete(businessId);
             reconnectAttempts.delete(businessId);
           } else {
             await setStatus(businessId, "reconnecting");
             const attempt = (reconnectAttempts.get(businessId) || 0) + 1;
             reconnectAttempts.set(businessId, attempt);
-            const delay = Math.min(3000 * Math.pow(2, attempt - 1), 60000);
-            sessions.delete(businessId);
+            const baseDelay = Math.min(3000 * Math.pow(2, attempt - 1), 60000);
+            const delay = baseDelay + Math.floor(baseDelay * 0.2 * Math.random());
+
+            // Release this exact session-generation lease before creating the
+            // replacement socket. A new generation gets a new owner token, so
+            // stale Signal writes from the old socket are fenced out in DB.
+            await releaseBusinessLease(businessId, st);
+            if (sessions.get(businessId) === st) sessions.delete(businessId);
+
             setTimeout(() => {
               startSession(businessId).catch((e) => {
                 if (e?.code === "SESSION_OWNED_ELSEWHERE") {
@@ -291,6 +327,7 @@ export function createSessionManager({
                   return;
                 }
                 logger.error({ e, businessId }, "reconnect failed");
+                scheduleResumeRetry(businessId);
               });
             }, delay).unref?.();
           }
