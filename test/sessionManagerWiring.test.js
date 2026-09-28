@@ -27,3 +27,17 @@ test("bulk session resume is bounded and Baileys version lookup is cached per pr
   assert.match(source, /const workerCount = Math\.min\(RESUME_CONCURRENCY, rows\.length\)/);
   assert.match(source, /await Promise\.all\(Array\.from\(\{ length: workerCount \}, \(\) => resumeWorker\(\)\)\)/);
 });
+
+
+test("reconnect generations use unique fenced lease owners and ignore stale sockets", async () => {
+  const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
+  assert.match(source, /import \{ randomUUID \} from "node:crypto"/);
+  assert.match(source, /leaseOwner:\s*null/);
+  assert.match(source, /st\.leaseOwner = `\$\{instanceId\}:\$\{randomUUID\(\)\}`/);
+  assert.match(source, /useSupabaseAuthState\(supabase, businessId, st\.leaseOwner\)/);
+  assert.match(source, /renewLease\?\.\(businessId, leaseOwner, leaseSeconds\)/);
+  assert.match(source, /releaseLease\(businessId, leaseOwner\)/);
+  assert.match(source, /sessions\.get\(businessId\) !== st \|\| st\.sock !== sock/);
+  assert.match(source, /await releaseBusinessLease\(businessId, st\);\s*if \(sessions\.get\(businessId\) === st\) sessions\.delete\(businessId\)/s);
+  assert.match(source, /scheduleResumeRetry\(businessId\);/);
+});
