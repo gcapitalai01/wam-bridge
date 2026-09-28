@@ -41,3 +41,9 @@ test("reconnect generations use unique fenced lease owners and ignore stale sock
   assert.match(source, /await releaseBusinessLease\(businessId, st\);\s*if \(sessions\.get\(businessId\) === st\) sessions\.delete\(businessId\)/s);
   assert.match(source, /scheduleResumeRetry\(businessId\);/);
 });
+
+
+test("lease takeover retry is capped for fast production failover", async () => {
+  const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
+  assert.match(source, /Math\.min\(15000, leaseSeconds \* 1000\)/);
+});
