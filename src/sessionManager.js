@@ -32,9 +32,9 @@ export function createSessionManager({
   // once the old instance's lease actually expires or it releases on
   // shutdown, instead of waiting out one fixed ~lease-length interval.
   // Backs off up to leaseSeconds*1000 if acquisition keeps failing, so a
-  // genuinely stuck business does not hammer the DB forever.
+  // genuinely stuck business does not hammer the DB forever. Keep the cap at\n  // 15s so an expired/released lease cannot leave a business offline for ~45s.
   const LEASE_RETRY_FLOOR_MS = 3000;
-  const LEASE_RETRY_CEILING_MS = Math.max(LEASE_RETRY_FLOOR_MS, leaseSeconds * 1000);
+  const LEASE_RETRY_CEILING_MS = Math.max(LEASE_RETRY_FLOOR_MS, Math.min(15000, leaseSeconds * 1000));
   const leaseRetryBackoff = new Map(); // businessId -> current retry delay ms
   const RESUME_CONCURRENCY = 5;
   const RESUME_STAGGER_MS = 250;
