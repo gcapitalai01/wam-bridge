@@ -11,3 +11,12 @@ test("production server wires WhatsApp inbound through the gated pipeline", asyn
   assert.doesNotMatch(source, /createSimpleInboundHandler/);
   assert.doesNotMatch(source, /handleSimpleInbound/);
 });
+
+
+test("text replies disable optional automatic link previews", async () => {
+  const source = await readFile(new URL("../server.js", import.meta.url), "utf8");
+  assert.match(source, /function safeTextContent\(payload\)/);
+  assert.match(source, /return \{ \.\.\.content, linkPreview: null \}/);
+  assert.match(source, /const content = safeTextContent\(payload\)/);
+  assert.match(source, /const payload = safeTextContent\(content\)/);
+});

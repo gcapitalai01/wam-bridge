@@ -38,6 +38,9 @@ export function createSessionManager({
   const leaseRetryBackoff = new Map(); // businessId -> current retry delay ms
   const RESUME_CONCURRENCY = 5;
   const RESUME_STAGGER_MS = 250;
+  const FAST_TRANSIENT_DISCONNECT_CODES = new Set([408, 428, 503, 515]);
+  const FAST_RECONNECT_BASE_MS = 750;
+  const FAST_RECONNECT_MAX_MS = 5000;
   let baileysVersionPromise = null;
 
   async function getBaileysVersion() {
@@ -61,6 +64,24 @@ export function createSessionManager({
 
   function resetLeaseRetryDelay(businessId) {
     leaseRetryBackoff.delete(businessId);
+  }
+
+  function disconnectStatusCode(lastDisconnect) {
+    const raw =
+      lastDisconnect?.error?.output?.statusCode ??
+      lastDisconnect?.error?.data?.statusCode ??
+      lastDisconnect?.error?.data?.attrs?.code ??
+      null;
+    const code = Number(raw);
+    return Number.isFinite(code) ? code : null;
+  }
+
+  function reconnectDelayMs(statusCode, attempt) {
+    const transient = FAST_TRANSIENT_DISCONNECT_CODES.has(statusCode);
+    const base = transient ? FAST_RECONNECT_BASE_MS : 3000;
+    const ceiling = transient ? FAST_RECONNECT_MAX_MS : 60000;
+    const exponential = Math.min(base * Math.pow(2, Math.max(0, attempt - 1)), ceiling);
+    return exponential + Math.floor(exponential * 0.15 * Math.random());
   }
 
   function clearResumeRetry(businessId) {
@@ -289,7 +310,7 @@ export function createSessionManager({
           st.connecting = false;
           clearLeaseTimer(st);
 
-          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          const statusCode = disconnectStatusCode(lastDisconnect);
           const loggedOut =
             statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
@@ -311,8 +332,15 @@ export function createSessionManager({
             await setStatus(businessId, "reconnecting");
             const attempt = (reconnectAttempts.get(businessId) || 0) + 1;
             reconnectAttempts.set(businessId, attempt);
-            const baseDelay = Math.min(3000 * Math.pow(2, attempt - 1), 60000);
-            const delay = baseDelay + Math.floor(baseDelay * 0.2 * Math.random());
+            const delay = reconnectDelayMs(statusCode, attempt);
+
+            logger.warn({
+              businessId,
+              statusCode,
+              attempt,
+              delayMs: delay,
+              fastTransient: FAST_TRANSIENT_DISCONNECT_CODES.has(statusCode),
+            }, "WhatsApp socket closed; reconnect scheduled");
 
             // Release this exact session-generation lease before creating the
             // replacement socket. A new generation gets a new owner token, so

@@ -47,3 +47,12 @@ test("lease takeover retry is capped for fast production failover", async () => 
   const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
   assert.match(source, /Math\.min\(15000, leaseSeconds \* 1000\)/);
 });
+
+
+test("transient WhatsApp disconnects use sub-second fast reconnect with bounded backoff", async () => {
+  const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
+  assert.match(source, /FAST_TRANSIENT_DISCONNECT_CODES = new Set\(\[408, 428, 503, 515\]\)/);
+  assert.match(source, /FAST_RECONNECT_BASE_MS = 750/);
+  assert.match(source, /FAST_RECONNECT_MAX_MS = 5000/);
+  assert.match(source, /const delay = reconnectDelayMs\(statusCode, attempt\)/);
+});

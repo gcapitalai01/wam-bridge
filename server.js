@@ -77,6 +77,18 @@ async function forwardIncomingToAI(payload, signal) {
 
 let sessionManager;
 
+function safeTextContent(payload) {
+  const content = safeTextContent(payload);
+  if (content?.text && typeof content.linkPreview === "undefined") {
+    // Baileys 6.x dynamically imports link-preview-js for URL previews.
+    // Production does not need previews to deliver chat replies; forcing null
+    // keeps URL-containing replies reliable even when the optional peer dep
+    // is unavailable or preview fetching fails.
+    return { ...content, linkPreview: null };
+  }
+  return content;
+}
+
 async function sendRegistered(key, payload, forcedMessageId = null) {
   const st = sessionManager.getState(key.businessId);
   if (!st?.sock || st.status !== "connected") {
@@ -139,7 +151,7 @@ const inboundPipeline = createPipeline({
       if (!st?.sock || st.status !== "connected") {
         throw new Error("WhatsApp session is not connected.");
       }
-      const payload = typeof content === "string" ? { text: content } : content;
+      const payload = safeTextContent(content);
       await st.sock.sendMessage(key.chatJid, payload, { messageId });
     },
   },
