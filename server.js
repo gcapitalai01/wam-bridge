@@ -78,7 +78,7 @@ async function forwardIncomingToAI(payload, signal) {
 let sessionManager;
 
 function safeTextContent(payload) {
-  const content = safeTextContent(payload);
+  const content = typeof payload === "string" ? { text: payload } : payload;
   if (content?.text && typeof content.linkPreview === "undefined") {
     // Baileys 6.x dynamically imports link-preview-js for URL previews.
     // Production does not need previews to deliver chat replies; forcing null
@@ -95,7 +95,7 @@ async function sendRegistered(key, payload, forcedMessageId = null) {
     throw new Error("WhatsApp session is not connected.");
   }
 
-  const content = typeof payload === "string" ? { text: payload } : payload;
+  const content = safeTextContent(payload);
   const messageId = forcedMessageId || generateMessageIDV2(st.sock.user?.id);
 
   // Register before send so the resulting fromMe echo can never loop back into AI.
