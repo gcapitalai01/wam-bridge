@@ -20,3 +20,12 @@ test("text replies disable optional automatic link previews", async () => {
   assert.match(source, /const content = safeTextContent\(payload\)/);
   assert.match(source, /const payload = safeTextContent\(content\)/);
 });
+
+
+test("safeTextContent does not recurse and is used by all text send paths", async () => {
+  const source = await readFile(new URL("../server.js", import.meta.url), "utf8");
+  assert.match(source, /function safeTextContent\(payload\) \{\s*const content = typeof payload === "string" \? \{ text: payload \} : payload;/s);
+  assert.doesNotMatch(source, /function safeTextContent\(payload\) \{\s*const content = safeTextContent\(payload\)/s);
+  assert.match(source, /async function sendRegistered[\s\S]*?const content = safeTextContent\(payload\)/);
+  assert.match(source, /deliver: async[\s\S]*?const payload = safeTextContent\(content\)/);
+});
