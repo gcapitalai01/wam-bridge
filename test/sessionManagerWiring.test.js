@@ -49,10 +49,20 @@ test("lease takeover retry is capped for fast production failover", async () => 
 });
 
 
-test("transient WhatsApp disconnects use sub-second fast reconnect with bounded backoff", async () => {
+test("transient WhatsApp disconnects use bounded reconnect backoff", async () => {
   const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
   assert.match(source, /FAST_TRANSIENT_DISCONNECT_CODES = new Set\(\[408, 428, 503, 515\]\)/);
-  assert.match(source, /FAST_RECONNECT_BASE_MS = 750/);
-  assert.match(source, /FAST_RECONNECT_MAX_MS = 5000/);
+  assert.match(source, /FAST_RECONNECT_BASE_MS = 1500/);
+  assert.match(source, /FAST_RECONNECT_MAX_MS = 10000/);
   assert.match(source, /const delay = reconnectDelayMs\(statusCode, attempt\)/);
+  assert.match(source, /scheduleReconnect\(businessId, delay\)/);
+});
+
+test("reconnect backoff resets only after a stable connection window", async () => {
+  const source = await readFile(new URL("../src/sessionManager.js", import.meta.url), "utf8");
+  assert.match(source, /const reconnectTimers = new Map\(\)/);
+  assert.match(source, /const STABLE_CONNECTION_MS = 10 \* 60 \* 1000/);
+  assert.match(source, /st\.stabilityTimer = setTimeout\(\(\) => \{/);
+  assert.match(source, /if \(reconnectTimers\.has\(businessId\)\) return/);
+  assert.match(source, /clearReconnectTimer\(businessId\)/);
 });
