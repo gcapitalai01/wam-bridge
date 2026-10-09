@@ -8,7 +8,7 @@ test("session manager retries deploy lease takeover without duplicate timers", a
   assert.match(source, /if \(resumeRetryTimers\.has\(businessId\)\) return/);
   assert.match(source, /if \(e\?\.code === "SESSION_OWNED_ELSEWHERE"\) \{\s*scheduleResumeRetry\(row\.business_id\)/s);
   assert.match(source, /clearResumeRetry\(businessId\);\s*st\.lastLeaseRenewedAt/s);
-  assert.match(source, /clearResumeRetry\(businessId\);\s*clearLeaseTimer\(st\)/s);
+  assert.match(source, /clearResumeRetry\(businessId\);\s*clearReconnectTimer\(businessId\);\s*clearLeaseTimer\(st\)/s);
 });
 
 
