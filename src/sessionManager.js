@@ -25,6 +25,7 @@ export function createSessionManager({
 }) {
   const sessions = new Map();
   const reconnectAttempts = new Map();
+  const reconnectTimers = new Map();
   const resumeRetryTimers = new Map();
   const leaseRenewMs = Math.max(5000, Math.floor((leaseSeconds * 1000) / 3));
   // Fast, capped-exponential retry for lease takeover. Starts quick (a few
@@ -39,8 +40,9 @@ export function createSessionManager({
   const RESUME_CONCURRENCY = 5;
   const RESUME_STAGGER_MS = 250;
   const FAST_TRANSIENT_DISCONNECT_CODES = new Set([408, 428, 503, 515]);
-  const FAST_RECONNECT_BASE_MS = 750;
-  const FAST_RECONNECT_MAX_MS = 5000;
+  const FAST_RECONNECT_BASE_MS = 1500;
+  const FAST_RECONNECT_MAX_MS = 10000;
+  const STABLE_CONNECTION_MS = 10 * 60 * 1000;
   let baileysVersionPromise = null;
 
   async function getBaileysVersion() {
@@ -82,6 +84,34 @@ export function createSessionManager({
     const ceiling = transient ? FAST_RECONNECT_MAX_MS : 60000;
     const exponential = Math.min(base * Math.pow(2, Math.max(0, attempt - 1)), ceiling);
     return exponential + Math.floor(exponential * 0.15 * Math.random());
+  }
+
+  function clearReconnectTimer(businessId) {
+    const timer = reconnectTimers.get(businessId);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(businessId);
+  }
+
+  function clearStabilityTimer(st) {
+    if (st?.stabilityTimer) clearTimeout(st.stabilityTimer);
+    if (st) st.stabilityTimer = null;
+  }
+
+  function scheduleReconnect(businessId, delayMs) {
+    if (reconnectTimers.has(businessId)) return;
+    const timer = setTimeout(() => {
+      reconnectTimers.delete(businessId);
+      startSession(businessId).catch((e) => {
+        if (e?.code === "SESSION_OWNED_ELSEWHERE") {
+          scheduleResumeRetry(businessId);
+          return;
+        }
+        logger.error({ e, businessId }, "reconnect failed");
+        scheduleResumeRetry(businessId);
+      });
+    }, delayMs);
+    timer.unref?.();
+    reconnectTimers.set(businessId, timer);
   }
 
   function clearResumeRetry(businessId) {
@@ -128,6 +158,8 @@ export function createSessionManager({
         phone: null,
         connecting: false,
         leaseTimer: null,
+        stabilityTimer: null,
+        connectedAt: null,
         lastLeaseRenewedAt: null,
         leaseOwner: null,
       });
@@ -142,6 +174,7 @@ export function createSessionManager({
 
   function terminateForLeaseLoss(businessId, st, reason) {
     clearLeaseTimer(st);
+    clearStabilityTimer(st);
     logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
     try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
     if (sessions.get(businessId) === st) sessions.delete(businessId);
@@ -150,6 +183,7 @@ export function createSessionManager({
 
   async function releaseBusinessLease(businessId, st) {
     clearLeaseTimer(st);
+    clearStabilityTimer(st);
     resetLeaseRetryDelay(businessId);
     const leaseOwner = st?.leaseOwner;
     if (releaseLease && leaseOwner) {
@@ -300,15 +334,32 @@ export function createSessionManager({
           st.qr = null;
           st.pairingCode = null;
           st.connecting = false;
-          reconnectAttempts.delete(businessId);
+          st.connectedAt = Date.now();
+          clearStabilityTimer(st);
+          clearReconnectTimer(businessId);
           await setStatus(businessId, "connected", {
             phone: sock.user?.id ? jidNormalizedUser(sock.user.id).split("@")[0] : null,
           });
+
+          st.stabilityTimer = setTimeout(() => {
+            if (
+              sessions.get(businessId) === st &&
+              st.sock === sock &&
+              st.status === "connected"
+            ) {
+              reconnectAttempts.delete(businessId);
+              logger.info({ businessId, stableMs: STABLE_CONNECTION_MS },
+                "WhatsApp connection stable; reconnect backoff reset");
+            }
+            st.stabilityTimer = null;
+          }, STABLE_CONNECTION_MS);
+          st.stabilityTimer.unref?.();
         }
 
         if (connection === "close") {
           st.connecting = false;
           clearLeaseTimer(st);
+          clearStabilityTimer(st);
 
           const statusCode = disconnectStatusCode(lastDisconnect);
           const loggedOut =
@@ -348,16 +399,7 @@ export function createSessionManager({
             await releaseBusinessLease(businessId, st);
             if (sessions.get(businessId) === st) sessions.delete(businessId);
 
-            setTimeout(() => {
-              startSession(businessId).catch((e) => {
-                if (e?.code === "SESSION_OWNED_ELSEWHERE") {
-                  scheduleResumeRetry(businessId);
-                  return;
-                }
-                logger.error({ e, businessId }, "reconnect failed");
-                scheduleResumeRetry(businessId);
-              });
-            }, delay).unref?.();
+            scheduleReconnect(businessId, delay);
           }
         }
       });
@@ -381,7 +423,10 @@ export function createSessionManager({
   async function stopSession(businessId) {
     const st = getState(businessId);
     clearResumeRetry(businessId);
+    clearReconnectTimer(businessId);
     clearLeaseTimer(st);
+    clearStabilityTimer(st);
+    reconnectAttempts.delete(businessId);
     if (st.sock) {
       try { await st.sock.logout(); } catch (_) {}
     }
@@ -435,9 +480,12 @@ export function createSessionManager({
   async function shutdownAll() {
     for (const timer of resumeRetryTimers.values()) clearTimeout(timer);
     resumeRetryTimers.clear();
+    for (const timer of reconnectTimers.values()) clearTimeout(timer);
+    reconnectTimers.clear();
     const entries = [...sessions.entries()];
     for (const [businessId, st] of entries) {
       clearLeaseTimer(st);
+      clearStabilityTimer(st);
       try { st.sock?.end?.(new Error("bridge shutdown")); } catch (_) {}
       await releaseBusinessLease(businessId, st);
     }
