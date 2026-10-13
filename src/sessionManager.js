@@ -221,10 +221,14 @@ export function createSessionManager({
       renewInFlight = true;
       try {
         const ok = await renewLease?.(businessId, leaseOwner, leaseSeconds);
-        if (ok === false) {
-          terminateForLeaseLoss(businessId, st, "owner_changed");
+        // A renewal is valid only when the database explicitly confirms ownership.
+        // Null/undefined must never extend a live socket's local lease clock.
+        if (ok !== true) {
+          terminateForLeaseLoss(businessId, st, "owner_unconfirmed");
           return;
         }
+        // An expired local lease cannot be resurrected by a late RPC response.
+        if (sessions.get(businessId) !== st || st.leaseOwner !== leaseOwner) return;
         st.lastLeaseRenewedAt = Date.now();
       } catch (err) {
         logger.error({ err, businessId }, "lease renewal failed");
