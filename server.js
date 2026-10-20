@@ -405,6 +405,29 @@ app.post("/session/:businessId/stop", requireBridgeKey, async (req, res) => {
   }
 });
 
+app.post("/session/:businessId/check", requireBridgeKey, async (req, res) => {
+  const st = sessionManager.getState(req.params.businessId);
+  if (!st?.sock || st.status !== "connected") {
+    return res.status(409).json({ error: "WhatsApp session is not connected." });
+  }
+  const body = req.body || {};
+  const list = (Array.isArray(body.phones) ? body.phones : [body.phone])
+    .map((p) => String(p || "").replace(/\D/g, ""))
+    .filter((d) => d.length >= 8 && d.length <= 15)
+    .slice(0, 50);
+  if (!list.length) return res.status(400).json({ error: "phone or phones required" });
+  try {
+    const out = await st.sock.onWhatsApp(...list.map((d) => `${d}@s.whatsapp.net`));
+    const found = new Map((out || []).map((r) => [String(r.jid || "").split("@")[0].split(":")[0], !!r.exists]));
+    const results = list.map((d) => ({ phone: d, exists: found.get(d) === true }));
+    if (!Array.isArray(body.phones)) return res.json({ ok: true, exists: results[0].exists });
+    res.json({ ok: true, results });
+  } catch (err) {
+    logger.error({ err }, "check failed");
+    res.status(502).json({ error: err?.message || String(err) });
+  }
+});
+
 app.post("/session/:businessId/send", requireBridgeKey, async (req, res) => {
   const { phone, text, idempotencyKey } = req.body || {};
   if (!phone || !text) {
