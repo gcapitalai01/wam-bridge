@@ -10,6 +10,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { useSupabaseAuthState } from "./authState.js";
+import { getSentMessage } from "./sentCache.js";
 
 export function createSessionManager({
   supabase,
@@ -291,7 +292,20 @@ export function createSessionManager({
         // We do not use privacy/blocklist/business-profile init queries. They are
         // optional in Baileys and can time out/reconnect long-lived headless sockets.
         fireInitQueries: false,
-        getMessage: async () => undefined,
+        // Baileys calls this when a recipient sends a retry receipt (could not decrypt).
+        // Returning undefined makes the recipient stay on "Waiting for this message".
+        getMessage: async (key) => {
+          try {
+            const id = key?.id;
+            if (!id) return undefined;
+            const mem = getSentMessage(id);
+            if (mem) return mem;
+            const { data } = await supabase.from("wam_messages").select("text")
+              .eq("business_id", businessId).eq("wa_message_id", id).eq("direction", "out").limit(1).maybeSingle();
+            if (data?.text) return { conversation: data.text };
+          } catch (_) {}
+          return undefined;
+        },
       });
 
       st.sock = sock;
