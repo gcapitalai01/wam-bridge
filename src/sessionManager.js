@@ -314,7 +314,7 @@ export function createSessionManager({
         browser: Browsers.ubuntu("Chrome"),
         markOnlineOnConnect: false,
         syncFullHistory: false,
-        shouldSyncHistoryMessage: () => false,
+        // Retain Baileys v7 default initial LID mapping sync; full history stays off.
         // We do not use privacy/blocklist/business-profile init queries. They are
         // optional in Baileys and can time out/reconnect long-lived headless sockets.
         fireInitQueries: false,
