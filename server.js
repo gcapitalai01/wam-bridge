@@ -1,3 +1,4 @@
+import { redactLog } from "./src/safeLogging.js";
 // G Capital AI — WhatsApp Bridge.
 // Production inbound path: Baileys -> idempotency/fromMe -> business-intent gate ->
 // debounce/state validation -> central Brain -> verified WhatsApp send.
@@ -36,7 +37,7 @@ if (startupErrors.length) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+const logger = pino({ level: process.env.LOG_LEVEL || "info", hooks: { logMethod(args, method) { method.apply(this,args.map(x=>redactLog(x))); } } });
 
 // Crash safety net. Baileys' internal retry/relay machinery is known to
 // occasionally throw an unhandled Boom error deep inside a mutex-wrapped

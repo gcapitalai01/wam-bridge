@@ -32,14 +32,16 @@ function fakeSupabase({ writeDelayForMarker = {} } = {}) {
       const currentOwner = owners.get(args.p_business);
       if (currentOwner !== args.p_owner_instance) return { data: false, error: null };
 
-      if (fn === "wa_auth_write_if_owner") {
-        const marker = args.p_value?.marker;
-        const delay = writeDelayForMarker[marker] || 0;
-        if (delay) await sleep(delay);
-        const key = `${args.p_business}|${args.p_data_key}`;
-        if (args.p_delete) rows.delete(key);
-        else rows.set(key, { value: args.p_value });
-        return { data: true, error: null };
+      if (fn === "wa_auth_write_batch_if_owner") {
+        const entries=args.p_entries;
+        const delay=writeDelayForMarker[entries[0]?.value?.marker] || 0;
+        if(delay) await sleep(delay);
+        if(owners.get(args.p_business)!==args.p_owner_instance) return {data:false,error:null};
+        for(const e of entries){
+          const key=`${args.p_business}|${e.key}`;
+          if(e.delete) rows.delete(key);else rows.set(key,{value:e.value});
+        }
+        return {data:true,error:null};
       }
 
       if (fn === "wa_auth_clear_if_owner") {
@@ -124,3 +126,15 @@ test("clearAll is fenced and cannot erase auth owned by a newer session", async 
 
   assert.equal(db.rows.has("business-1|session-bob"), true);
 });
+
+ test("queued key snapshots cannot be changed by later caller mutation",async()=>{
+ const db=fakeSupabase({writeDelayForMarker:{1:25}});db.setOwner("b","o");
+ const a=await useSupabaseAuthState(db,"b","o");
+ const slow=a.state.keys.set({session:{one:{marker:1}}});
+ const input={session:{two:{marker:2}}};const queued=a.state.keys.set(input);input.session.two.marker=99;
+ await Promise.all([slow,queued]);assert.equal(db.rows.get("b|session-two").value.marker,2);
+ });
+ test("flush waits for durable pending key writes",async()=>{
+ const db=fakeSupabase({writeDelayForMarker:{1:25}});db.setOwner("b","o");const a=await useSupabaseAuthState(db,"b","o");
+ const write=a.state.keys.set({session:{one:{marker:1}}});await a.flush();assert.equal(db.rows.get("b|session-one").value.marker,1);await write;
+ });

@@ -6,7 +6,6 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
-  makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { useSupabaseAuthState } from "./authState.js";
@@ -25,6 +24,8 @@ export function createSessionManager({
   leaseSeconds = 45,
 }) {
   const sessions = new Map();
+  const starting = new Map();
+  let shuttingDown = false;
   const reconnectAttempts = new Map();
   const reconnectTimers = new Map();
   const resumeRetryTimers = new Map();
@@ -99,6 +100,7 @@ export function createSessionManager({
   }
 
   function scheduleReconnect(businessId, delayMs) {
+    if (shuttingDown) return;
     if (reconnectTimers.has(businessId)) return;
     const timer = setTimeout(() => {
       reconnectTimers.delete(businessId);
@@ -122,6 +124,7 @@ export function createSessionManager({
   }
 
   function scheduleResumeRetry(businessId, delayMsOverride) {
+    if (shuttingDown) return;
     if (resumeRetryTimers.has(businessId)) return;
     const delayMs = delayMsOverride ?? nextLeaseRetryDelay(businessId);
     const timer = setTimeout(async () => {
@@ -170,14 +173,16 @@ export function createSessionManager({
 
   function clearLeaseTimer(st) {
     if (st?.leaseTimer) clearInterval(st.leaseTimer);
-    if (st) st.leaseTimer = null;
+    if (st?.leaseWatchdog) clearInterval(st.leaseWatchdog);
+    if (st) { st.leaseTimer = null; st.leaseWatchdog = null; }
   }
 
   function terminateForLeaseLoss(businessId, st, reason) {
     clearLeaseTimer(st);
     clearStabilityTimer(st);
     logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
-    try { st.sock?.end?.(new Error("session lease lost")); } catch (_) {}
+    const sock=st.sock; st.sock=null; st.status="reconnecting"; st.connecting=false;
+    try { sock?.end?.(new Error("session lease lost")); } catch (_) {}
     if (sessions.get(businessId) === st) sessions.delete(businessId);
     scheduleResumeRetry(businessId);
   }
@@ -186,6 +191,7 @@ export function createSessionManager({
     clearLeaseTimer(st);
     clearStabilityTimer(st);
     resetLeaseRetryDelay(businessId);
+    await st?.authStore?.flush();
     const leaseOwner = st?.leaseOwner;
     if (releaseLease && leaseOwner) {
       await releaseLease(businessId, leaseOwner).catch((err) =>
@@ -245,6 +251,13 @@ export function createSessionManager({
     }, leaseRenewMs);
     timer.unref?.();
     st.leaseTimer = timer;
+    // Independent of the renewal promise: a hung RPC must not keep a socket alive.
+    st.leaseWatchdog=setInterval(()=>{
+      if(Date.now()-(st.lastLeaseRenewedAt || 0)>=leaseSeconds*1000*0.8) {
+        terminateForLeaseLoss(businessId,st,"lease_deadline_exceeded");
+      }
+    },1000);
+    st.leaseWatchdog.unref?.();
   }
 
   async function setStatus(businessId, status, extra = {}) {
@@ -254,7 +267,17 @@ export function createSessionManager({
     await onClientStatus?.(businessId, status, extra.phone ?? st.phone);
   }
 
-  async function startSession(businessId, phoneNumberForPairing) {
+  function startSession(businessId, phoneNumberForPairing) {
+    if(shuttingDown) return Promise.reject(new Error("BRIDGE_SHUTTING_DOWN"));
+    if(starting.has(businessId)) return starting.get(businessId);
+    const pending=startSessionOnce(businessId,phoneNumberForPairing).finally(()=>{
+      if(starting.get(businessId)===pending) starting.delete(businessId);
+    });
+    starting.set(businessId,pending);
+    return pending;
+  }
+
+  async function startSessionOnce(businessId, phoneNumberForPairing) {
     if (canConnect) {
       const access = await canConnect(businessId);
       if (!access?.allowed) {
@@ -275,13 +298,16 @@ export function createSessionManager({
       leaseAcquired = true;
       st.connecting = true;
 
-      const { state: authState, saveCreds, clearAll } = await useSupabaseAuthState(supabase, businessId, st.leaseOwner);
+      const authStore = await useSupabaseAuthState(supabase, businessId, st.leaseOwner);
+      st.authStore = authStore;
+      const { state: authState, saveCreds } = authStore;
       const version = await getBaileysVersion();
+      if (shuttingDown || sessions.get(businessId)!==st || Date.now()-st.lastLeaseRenewedAt>=leaseSeconds*1000*0.8) throw new Error("SESSION_START_LEASE_EXPIRED");
       const sock = makeWASocket({
         version,
         auth: {
           creds: authState.creds,
-          keys: makeCacheableSignalKeyStore(authState.keys, logger),
+          keys: authState.keys, // Never cache a Signal mutation before durable commit.
         },
         logger,
         printQRInTerminal: false,
@@ -324,12 +350,14 @@ export function createSessionManager({
       }
 
       sock.ev.on("creds.update", () => {
+        if (sessions.get(businessId) !== st || st.sock !== sock) return;
         saveCreds().catch((err) => {
           if (err?.code === "AUTH_WRITE_LEASE_LOST") {
             logger.warn({ businessId }, "ignored stale creds.update after lease handoff");
             return;
           }
-          logger.error({ err, businessId }, "creds.update persistence failed");
+          logger.error({ code: err?.code, businessId }, "creds.update persistence failed");
+          terminateForLeaseLoss(businessId,st,"auth_persistence_failed");
         });
       });
 
@@ -339,6 +367,7 @@ export function createSessionManager({
           return;
         }
 
+        if (shuttingDown) return;
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -385,15 +414,7 @@ export function createSessionManager({
 
           if (loggedOut) {
             await setStatus(businessId, "disconnected");
-            try {
-              await clearAll();
-            } catch (err) {
-              if (err?.code === "AUTH_WRITE_LEASE_LOST") {
-                logger.warn({ businessId }, "skipped auth clear after lease handoff");
-              } else {
-                logger.error({ err, businessId }, "failed to clear logged-out auth state");
-              }
-            }
+            // Preserve credentials for inspection/recovery; never erase on a remote close.
             await releaseBusinessLease(businessId, st);
             if (sessions.get(businessId) === st) sessions.delete(businessId);
             reconnectAttempts.delete(businessId);
@@ -422,7 +443,18 @@ export function createSessionManager({
         }
       });
 
+      sock.ev.on("messages.update", (updates) => {
+        if(sessions.get(businessId)!==st || st.sock!==sock) return;
+        for(const {key,update} of updates || []) {
+          if(key?.fromMe && update?.status != null) logger.info({businessId,messageId:key.id,status:update.status},"outbound delivery status");
+        }
+      });
+      sock.ev.on("message-receipt.update", (updates) => {
+        if(sessions.get(businessId)!==st || st.sock!==sock) return;
+        for(const {key,receipt} of updates || []) logger.info({businessId,messageId:key?.id,delivered:!!receipt?.receiptTimestamp,read:!!receipt?.readTimestamp},"outbound receipt");
+      });
       sock.ev.on("messages.upsert", async (payload) => {
+        if (sessions.get(businessId) !== st || st.sock !== sock || shuttingDown) return;
         try {
           await onMessages?.(businessId, sock, payload);
         } catch (err) {
@@ -496,6 +528,8 @@ export function createSessionManager({
   }
 
   async function shutdownAll() {
+    shuttingDown = true;
+    await Promise.allSettled([...starting.values()]);
     for (const timer of resumeRetryTimers.values()) clearTimeout(timer);
     resumeRetryTimers.clear();
     for (const timer of reconnectTimers.values()) clearTimeout(timer);

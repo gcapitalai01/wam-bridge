@@ -45,28 +45,12 @@ export async function useSupabaseAuthState(supabase, businessId, ownerInstance) 
     return data ? decode(data.value) : null;
   }
 
-  async function fencedWrite(key, value, remove = false) {
-    const { data, error } = await supabase.rpc("wa_auth_write_if_owner", {
-      p_business: businessId,
-      p_owner_instance: ownerInstance,
-      p_data_key: key,
-      p_value: remove ? null : encode(value),
-      p_delete: remove,
+  async function writeBatch(entries) {
+    const {data,error} = await supabase.rpc("wa_auth_write_batch_if_owner", {
+      p_business:businessId,p_owner_instance:ownerInstance,p_entries:entries,
     });
-    if (error) throw new Error(`wam_auth_state fenced write: ${error.message}`);
-    if (data !== true) {
-      throw Object.assign(new Error("AUTH_WRITE_LEASE_LOST"), {
-        code: "AUTH_WRITE_LEASE_LOST",
-      });
-    }
-  }
-
-  async function writeData(key, value) {
-    return fencedWrite(key, value, false);
-  }
-
-  async function removeData(key) {
-    return fencedWrite(key, null, true);
+    if(error) throw new Error(`wam_auth_state batch write: ${error.code || "database_error"}`);
+    if(data !== true) throw Object.assign(new Error("AUTH_WRITE_LEASE_LOST"),{code:"AUTH_WRITE_LEASE_LOST"});
   }
 
   const creds = (await withAuthLock(businessId, () => readData("creds"))) || initAuthCreds();
@@ -87,20 +71,24 @@ export async function useSupabaseAuthState(supabase, businessId, ownerInstance) 
           return out;
         }),
 
-        set: (data) => withAuthLock(businessId, async () => {
-          for (const category of Object.keys(data || {})) {
-            for (const id of Object.keys(data[category] || {})) {
-              const value = data[category][id];
-              const key = `${category}-${id}`;
-              if (value) await writeData(key, value);
-              else await removeData(key);
+        set: (data) => {
+          // Snapshot before waiting: Baileys may mutate the original objects later.
+          const entries=[];
+          for(const [category,values] of Object.entries(data || {})) {
+            for(const [id,value] of Object.entries(values || {})) {
+              entries.push({key:`${category}-${id}`,value:value == null ? null : encode(value),delete:value == null});
             }
           }
-        }),
+          return withAuthLock(businessId,()=>writeBatch(entries));
+        },
       },
     },
 
-    saveCreds: () => withAuthLock(businessId, () => writeData("creds", creds)),
+    saveCreds: () => {
+      const snapshot=encode(creds);
+      return withAuthLock(businessId,()=>writeBatch([{key:"creds",value:snapshot,delete:false}]));
+    },
+    flush: () => withAuthLock(businessId,async()=>{}),
 
     clearAll: () => withAuthLock(businessId, async () => {
       const { data, error } = await supabase.rpc("wa_auth_clear_if_owner", {
