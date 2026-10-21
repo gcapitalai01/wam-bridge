@@ -9,7 +9,7 @@ import { generateMessageIDV2, jidNormalizedUser } from "@whiskeysockets/baileys"
 
 import { createSessionManager } from "./src/sessionManager.js";
 import { createState } from "./src/state.js";
-import { rememberSentMessage } from "./src/sentCache.js";
+import { sendWithRetryCache } from "./src/sentCache.js";
 import { createPipeline } from "./src/pipeline.js";
 import { createWhatsAppAccessControl, createCachedAccessCheck } from "./src/accessControl.js";
 
@@ -101,8 +101,7 @@ async function sendRegistered(key, payload, forcedMessageId = null) {
 
   // Register before send so the resulting fromMe echo can never loop back into AI.
   await state.registerOutbound(key, messageId);
-  const sentMsg = await st.sock.sendMessage(key.chatJid, content, { messageId });
-  rememberSentMessage(sentMsg?.key?.id || messageId, sentMsg?.message || (content?.text ? { conversation: content.text } : content));
+  await sendWithRetryCache(st.sock, key.chatJid, content, messageId);
 
   if (content?.text) {
     await state.recordMessage(key, {
@@ -154,8 +153,7 @@ const inboundPipeline = createPipeline({
         throw new Error("WhatsApp session is not connected.");
       }
       const payload = safeTextContent(content);
-      const sentMsg = await st.sock.sendMessage(key.chatJid, payload, { messageId });
-      rememberSentMessage(sentMsg?.key?.id || messageId, sentMsg?.message || (payload?.text ? { conversation: payload.text } : payload));
+      await sendWithRetryCache(st.sock, key.chatJid, payload, messageId);
     },
   },
 });
