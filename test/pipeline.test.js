@@ -344,3 +344,24 @@ test("Fresh personal append enters NO_GATE debounce without immediate AI call", 
   assert.equal(row?.pending_batch?.length, 1);
   assert.equal(aiCalls, 0);
 });
+
+
+test("LID reply uses verified sender PN through recovered batch without changing tenant/history/dedupe", async () => {
+  const state = fakeState();
+  let aiKey, sendKey;
+  const options = { state, ai: async ({key}) => { aiKey = key; return "reply"; },
+    send: { prepareId: async () => "OUT-PN", deliver: async (key) => { sendKey = key; } } };
+  const first = createPipeline(options);
+  const event = raw("hello");
+  event.key.remoteJid = "186934676693107@lid";
+  event.key.senderPn = "13032617528@s.whatsapp.net";
+  const key = {businessId:"b1",connectionId:"c1",chatJid:event.key.remoteJid};
+  await first.handle(event,key);
+  const recovered = createPipeline(options);
+  const result = await recovered.flush(key,1);
+  assert.equal(result.status,"SENT");
+  assert.equal(aiKey.replyJid,event.key.senderPn);
+  assert.deepEqual(sendKey,{...key,replyJid:event.key.senderPn});
+  assert.equal(state.messages.at(-1).key,"b1|c1|186934676693107@lid");
+  assert.equal((await recovered.handle(event,key)).classification,"DUPLICATE");
+});

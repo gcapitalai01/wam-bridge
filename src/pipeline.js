@@ -67,6 +67,9 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
       }
 
       const last = batch.items[batch.items.length - 1];
+      // Keep the original chat key for history, dedupe and human-mute state.
+      // Persist the verified reply route in the batch so crash recovery keeps it.
+      key = { ...key, replyJid: last.replyJid || null };
       const pushName = last.pushName || null;
       const language = last.language || "en";
       const text = batch.items.map((i) => i.text).filter(Boolean).join("\n");
@@ -196,7 +199,7 @@ export function createPipeline({ state, ai, send, log = console, now = () => Dat
 
     const item = {
       id: norm.id, type: norm.messageType, text: norm.text, language: lang.language,
-      reason: "NO_GATE", pushName: norm.pushName || null,
+      reason: "NO_GATE", pushName: norm.pushName || null, replyJid: norm.replyJid,
     };
     const q = await state.enqueue(key, item, {
       activate: true,

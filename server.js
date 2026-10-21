@@ -121,8 +121,8 @@ const inboundPipeline = createPipeline({
   log: logger,
   checkAccess: checkWhatsAppAccessCached,
   ai: async ({ key, items, text, language, pushName, signal }) => {
-    const phone = String(key.chatJid || "").endsWith("@s.whatsapp.net")
-      ? String(key.chatJid).split("@")[0].split(":")[0]
+    const phone = String(key.replyJid || key.chatJid || "").endsWith("@s.whatsapp.net")
+      ? String(key.replyJid || key.chatJid).split("@")[0].split(":")[0]
       : null;
     const data = await forwardIncomingToAI({
       business_id: key.businessId,
@@ -154,7 +154,7 @@ const inboundPipeline = createPipeline({
         throw new Error("WhatsApp session is not connected.");
       }
       const payload = safeTextContent(content);
-      await sendWithRetryCache(st.sock, key.chatJid, payload, messageId);
+      await sendWithRetryCache(st.sock, key.replyJid || key.chatJid, payload, messageId);
     },
   },
 });

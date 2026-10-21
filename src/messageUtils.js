@@ -56,6 +56,11 @@ export function extractMessage(raw) {
   return {
     id: raw.key.id,
     chatJid: raw.key.remoteJid,
+    // Only trust the PN bound to this direct message by WhatsApp metadata.
+    replyJid: !raw.key.fromMe && raw.key.remoteJid.endsWith("@lid")
+      ? [raw.key.senderPn, raw.key.remoteJidAlt].find((jid) =>
+          typeof jid === "string" && /^[0-9]+@s\.whatsapp\.net$/.test(jid)) || null
+      : null,
     fromMe: !!raw.key.fromMe,
     messageType,
     text,
