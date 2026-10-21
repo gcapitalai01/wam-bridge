@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "postinstall": "node scripts/patch-baileys-hosted-migration.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.45.4",

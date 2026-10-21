@@ -168,10 +168,13 @@ test("real Signal roundtrip survives PN to LID migration and durable store reloa
  await ar.injectE2ESession({jid:'222@s.whatsapp.net',session:{registrationId:b.state.creds.registrationId,identityKey:generateSignalPubKey(b.state.creds.signedIdentityKey.public),signedPreKey:{keyId:b.state.creds.signedPreKey.keyId,publicKey:generateSignalPubKey(b.state.creds.signedPreKey.keyPair.public),signature:b.state.creds.signedPreKey.signature},preKey:{keyId:1,publicKey:generateSignalPubKey(pre.public)}}});
  const first=await ar.encryptMessage({jid:'222@s.whatsapp.net',data:Buffer.from('first')});
  assert.equal((await br.decryptMessage({jid:'111@s.whatsapp.net',...first})).toString(),'first');
- await a.state.keys.set({'device-list':{'222':['0']}});await b.state.keys.set({'device-list':{'111':['0']}});
+ const existing=(await a.state.keys.get('session',['222.0']))['222.0'];
+ await a.state.keys.set({'session':{'222.99':existing,'222_128.99':existing},'device-list':{'222':['0','99']}});await b.state.keys.set({'device-list':{'111':['0']}});
  await ar.lidMapping.storeLIDPNMappings([{pn:'222@s.whatsapp.net',lid:'888@lid'}]);
  await br.lidMapping.storeLIDPNMappings([{pn:'111@s.whatsapp.net',lid:'999@lid'}]);
- await ar.migrateSession('222@s.whatsapp.net','888@lid');await br.migrateSession('111@s.whatsapp.net','999@lid');
+ await ar.migrateSession('222@s.whatsapp.net','888@lid');
+ assert.ok((await a.state.keys.get('session',['888_129.99']))['888_129.99']);
+ assert.ok((await a.state.keys.get('session',['222.99']))['222.99']);await br.migrateSession('111@s.whatsapp.net','999@lid');
  ar=create(await useSupabaseAuthState(db,'alice','a'));br=create(await useSupabaseAuthState(db,'bob','b'));
  for(let i=0;i<5;i++){
  const out=await ar.encryptMessage({jid:'888@lid',data:Buffer.from('out'+i)});
