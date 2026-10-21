@@ -138,3 +138,45 @@ test("clearAll is fenced and cannot erase auth owned by a newer session", async 
  const db=fakeSupabase({writeDelayForMarker:{1:25}});db.setOwner("b","o");const a=await useSupabaseAuthState(db,"b","o");
  const write=a.state.keys.set({session:{one:{marker:1}}});await a.flush();assert.equal(db.rows.get("b|session-one").value.marker,1);await write;
  });
+
+
+test("v7 auth categories persist across reloads and remain tenant isolated", async () => {
+ const db=fakeSupabase(); db.setOwner("b1","o1"); db.setOwner("b2","o2");
+ const a=await useSupabaseAuthState(db,"b1","o1");
+ const values={"lid-mapping":{"123":"456","456_reverse":"123"},"device-list":{"123":[0,99]},"tctoken":{"123":{token:Buffer.from([1,2,3])}},"app-state-sync-key":{"key1":{keyData:Buffer.from([4,5,6])}}};
+ await a.state.keys.set(values);
+ const reload=await useSupabaseAuthState(db,"b1","o1");
+ for(const [category,entries] of Object.entries(values)) {
+ const got=await reload.state.keys.get(category,Object.keys(entries));
+ for(const id of Object.keys(entries)) assert.ok(got[id]);
+ }
+ assert.deepEqual((await reload.state.keys.get("tctoken",["123"]))["123"].token,Buffer.from([1,2,3]));
+ const b=await useSupabaseAuthState(db,"b2","o2");
+ assert.deepEqual(await b.state.keys.get("lid-mapping",["123"]),{});
+});
+
+test("real Signal roundtrip survives PN to LID migration and durable store reload", async () => {
+ const {makeLibSignalRepository}=await import('../node_modules/@whiskeysockets/baileys/lib/Signal/libsignal.js');
+ const {addTransactionCapability,Curve,generateSignalPubKey}=await import('@whiskeysockets/baileys');
+ const log={trace(){},debug(){},info(){},warn(){},error(){}};
+ const db=fakeSupabase();db.setOwner('alice','a');db.setOwner('bob','b');
+ const a=await useSupabaseAuthState(db,'alice','a'),b=await useSupabaseAuthState(db,'bob','b');
+ await a.saveCreds();await b.saveCreds();
+ const create=store=>makeLibSignalRepository({creds:store.state.creds,keys:addTransactionCapability(store.state.keys,log,{maxCommitRetries:1,delayBetweenTriesMs:0})},log);
+ let ar=create(a),br=create(b);
+ const pre=Curve.generateKeyPair();await b.state.keys.set({'pre-key':{'1':pre}});
+ await ar.injectE2ESession({jid:'222@s.whatsapp.net',session:{registrationId:b.state.creds.registrationId,identityKey:generateSignalPubKey(b.state.creds.signedIdentityKey.public),signedPreKey:{keyId:b.state.creds.signedPreKey.keyId,publicKey:generateSignalPubKey(b.state.creds.signedPreKey.keyPair.public),signature:b.state.creds.signedPreKey.signature},preKey:{keyId:1,publicKey:generateSignalPubKey(pre.public)}}});
+ const first=await ar.encryptMessage({jid:'222@s.whatsapp.net',data:Buffer.from('first')});
+ assert.equal((await br.decryptMessage({jid:'111@s.whatsapp.net',...first})).toString(),'first');
+ await a.state.keys.set({'device-list':{'222':['0']}});await b.state.keys.set({'device-list':{'111':['0']}});
+ await ar.lidMapping.storeLIDPNMappings([{pn:'222@s.whatsapp.net',lid:'888@lid'}]);
+ await br.lidMapping.storeLIDPNMappings([{pn:'111@s.whatsapp.net',lid:'999@lid'}]);
+ await ar.migrateSession('222@s.whatsapp.net','888@lid');await br.migrateSession('111@s.whatsapp.net','999@lid');
+ ar=create(await useSupabaseAuthState(db,'alice','a'));br=create(await useSupabaseAuthState(db,'bob','b'));
+ for(let i=0;i<5;i++){
+ const out=await ar.encryptMessage({jid:'888@lid',data:Buffer.from('out'+i)});
+ assert.equal((await br.decryptMessage({jid:'999@lid',...out})).toString(),'out'+i);
+ const reply=await br.encryptMessage({jid:'999@lid',data:Buffer.from('reply'+i)});
+ assert.equal((await ar.decryptMessage({jid:'888@lid',...reply})).toString(),'reply'+i);
+ }
+});

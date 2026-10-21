@@ -64,7 +64,7 @@ export async function useSupabaseAuthState(supabase, businessId, ownerInstance) 
           for (const id of ids || []) {
             let value = await readData(`${type}-${id}`);
             if (type === "app-state-sync-key" && value) {
-              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+              value = proto.Message.AppStateSyncKeyData.create(value);
             }
             if (value) out[id] = value;
           }

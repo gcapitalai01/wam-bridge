@@ -154,7 +154,7 @@ const inboundPipeline = createPipeline({
         throw new Error("WhatsApp session is not connected.");
       }
       const payload = safeTextContent(content);
-      await sendWithRetryCache(st.sock, key.replyJid || key.chatJid, payload, messageId);
+      await sendWithRetryCache(st.sock, key.chatJid, payload, messageId);
     },
   },
 });
