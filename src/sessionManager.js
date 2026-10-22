@@ -22,6 +22,7 @@ export function createSessionManager({
   releaseLease,
   instanceId,
   leaseSeconds = 45,
+  watchdog,
 }) {
   const sessions = new Map();
   const starting = new Map();
@@ -104,17 +105,37 @@ export function createSessionManager({
     if (reconnectTimers.has(businessId)) return;
     const timer = setTimeout(() => {
       reconnectTimers.delete(businessId);
-      startSession(businessId).catch((e) => {
+      automaticStart(businessId).catch((e) => {
         if (e?.code === "SESSION_OWNED_ELSEWHERE") {
           scheduleResumeRetry(businessId);
           return;
         }
+        if (e?.code === "WHATSAPP_NOT_AUTHORIZED") { watchdog?.incident("access_blocked", businessId); return; }
         logger.error({ e, businessId }, "reconnect failed");
         scheduleResumeRetry(businessId);
       });
     }, delayMs);
     timer.unref?.();
     reconnectTimers.set(businessId, timer);
+  }
+
+  async function automaticStart(businessId) {
+    const delay = watchdog?.recoveryDelay(businessId) || 0;
+    if (delay) { scheduleResumeRetry(businessId, delay); return; }
+    return startSession(businessId);
+  }
+
+  function inspectSessions() {
+    if (shuttingDown) return;
+    for (const [businessId, st] of sessions) {
+      if (st.status === "connected" && st.sock?.ws?.isClosed === true) {
+        watchdog?.incident("socket_closed_without_event", businessId);
+        terminateForLeaseLoss(businessId, st, "watchdog_closed_socket");
+      } else if (st.status === "connecting" && Date.now() - (st.startedAt || Date.now()) > 90000) {
+        watchdog?.incident("connection_timeout", businessId);
+        terminateForLeaseLoss(businessId, st, "watchdog_connection_timeout");
+      }
+    }
   }
 
   function clearResumeRetry(businessId) {
@@ -130,8 +151,9 @@ export function createSessionManager({
     const timer = setTimeout(async () => {
       resumeRetryTimers.delete(businessId);
       try {
-        await startSession(businessId);
+        await automaticStart(businessId);
       } catch (e) {
+        if (e?.code === "WHATSAPP_NOT_AUTHORIZED") { watchdog?.incident("access_blocked", businessId); return; }
         // Compute the NEXT delay exactly once per failed attempt and reuse
         // it for both the log line and the actual timer -- calling the
         // backoff generator twice here was doubling the growth rate.
@@ -180,6 +202,7 @@ export function createSessionManager({
   function terminateForLeaseLoss(businessId, st, reason) {
     clearLeaseTimer(st);
     clearStabilityTimer(st);
+    watchdog?.incident("lease_lost", businessId);
     logger.error({ businessId, instanceId, reason }, "WhatsApp session lease lost");
     const sock=st.sock; st.sock=null; st.status="reconnecting"; st.connecting=false;
     try { sock?.end?.(new Error("session lease lost")); } catch (_) {}
@@ -336,6 +359,7 @@ export function createSessionManager({
 
       st.sock = sock;
       st.status = "connecting";
+      st.startedAt = Date.now();
 
       if (phoneNumberForPairing && !authState.creds.registered) {
         try {
@@ -382,6 +406,7 @@ export function createSessionManager({
           st.pairingCode = null;
           st.connecting = false;
           st.connectedAt = Date.now();
+          if (reconnectAttempts.has(businessId)) watchdog?.incident("connection_recovered", businessId);
           clearStabilityTimer(st);
           clearReconnectTimer(businessId);
           await setStatus(businessId, "connected", {
@@ -412,6 +437,7 @@ export function createSessionManager({
           const loggedOut =
             statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
+          watchdog?.incident(loggedOut ? "session_logged_out" : `disconnect_${statusCode || "unknown"}`, businessId);
           if (loggedOut) {
             await setStatus(businessId, "disconnected");
             // Preserve credentials for inspection/recovery; never erase on a remote close.
@@ -446,12 +472,16 @@ export function createSessionManager({
       sock.ev.on("messages.update", (updates) => {
         if(sessions.get(businessId)!==st || st.sock!==sock) return;
         for(const {key,update} of updates || []) {
+          if(key?.fromMe && update?.status != null) watchdog?.receipt(businessId, key.id, update.status);
           if(key?.fromMe && update?.status != null) logger.info({businessId,messageId:key.id,status:update.status},"outbound delivery status");
         }
       });
       sock.ev.on("message-receipt.update", (updates) => {
         if(sessions.get(businessId)!==st || st.sock!==sock) return;
-        for(const {key,receipt} of updates || []) logger.info({businessId,messageId:key?.id,delivered:!!receipt?.receiptTimestamp,read:!!receipt?.readTimestamp},"outbound receipt");
+        for(const {key,receipt} of updates || []) {
+          if(receipt?.receiptTimestamp || receipt?.readTimestamp) watchdog?.receipt(businessId,key?.id,3);
+          logger.info({businessId,messageId:key?.id,delivered:!!receipt?.receiptTimestamp,read:!!receipt?.readTimestamp},"outbound receipt");
+        }
       });
       sock.ev.on("messages.upsert", async (payload) => {
         if (sessions.get(businessId) !== st || st.sock !== sock || shuttingDown) return;
@@ -493,7 +523,7 @@ export function createSessionManager({
 
     if (error) {
       logger.error({ error }, "resumeAll query failed");
-      return;
+      throw new Error("RESUME_QUERY_FAILED");
     }
 
     const rows = data || [];
@@ -512,6 +542,7 @@ export function createSessionManager({
             scheduleResumeRetry(row.business_id);
           } else {
             logger.error({ e, businessId: row.business_id }, "resumeAll: session failed");
+            if(e?.code !== "WHATSAPP_NOT_AUTHORIZED") scheduleResumeRetry(row.business_id);
           }
         }
 
@@ -544,5 +575,5 @@ export function createSessionManager({
     sessions.clear();
   }
 
-  return { getState, startSession, stopSession, resumeAll, shutdownAll, sessions };
+  return { getState, startSession, stopSession, resumeAll, shutdownAll, sessions, inspectSessions };
 }

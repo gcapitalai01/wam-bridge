@@ -1,3 +1,4 @@
+import { createWatchdog } from "./src/watchdog.js";
 import { redactLog } from "./src/safeLogging.js";
 // G Capital AI — WhatsApp Bridge.
 // Production inbound path: Baileys -> idempotency/fromMe -> business-intent gate ->
@@ -37,7 +38,19 @@ if (startupErrors.length) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const logger = pino({ level: process.env.LOG_LEVEL || "info", hooks: { logMethod(args, method) { method.apply(this,args.map(x=>redactLog(x))); } } });
+let watchdog;
+const logger = pino({ level: process.env.LOG_LEVEL || "info", hooks: { logMethod(args, method) { method.apply(this,args.map(x=>redactLog(x)));
+ const msg = args.map(x => typeof x === "string" ? x : (x?.err?.message || x?.error?.message || "")).join(" ");
+ if (/Bad MAC|MessageCounterError|No matching sessions|failed to decrypt/i.test(msg)) watchdog?.incident("signal_decrypt_error"); } } });
+
+watchdog = createWatchdog({ alert: async (event) => {
+  logger.warn({ watchdogEvent: event }, "watchdog incident");
+  const r = await fetch(`${SUPABASE_URL}/functions/v1/wa-watchdog-alert`, {
+    method: "POST", headers: { "Content-Type": "application/json", "x-bridge-secret": WHATSAPP_BRIDGE_SECRET },
+    body: JSON.stringify(event), signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error("WATCHDOG_ALERT_FAILED");
+} });
 
 // Crash safety net. Baileys' internal retry/relay machinery is known to
 // occasionally throw an unhandled Boom error deep inside a mutex-wrapped
@@ -66,7 +79,7 @@ async function forwardIncomingToAI(payload, signal) {
       "x-bridge-secret": WHATSAPP_BRIDGE_SECRET,
     },
     body: JSON.stringify(payload),
-    signal,
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000),
   });
 
   const data = await res.json().catch(() => ({}));
@@ -102,7 +115,9 @@ async function sendRegistered(key, payload, forcedMessageId = null) {
 
   // Register before send so the resulting fromMe echo can never loop back into AI.
   await state.registerOutbound(key, messageId);
-  await sendWithRetryCache(st.sock, key.chatJid, content, messageId);
+  watchdog.sent(key.businessId, messageId);
+  try { await sendWithRetryCache(st.sock, key.chatJid, content, messageId); }
+  catch (e) { watchdog.incident("send_uncertain", key.businessId); throw e; }
 
   if (content?.text) {
     await state.recordMessage(key, {
@@ -124,7 +139,9 @@ const inboundPipeline = createPipeline({
     const phone = String(key.replyJid || key.chatJid || "").endsWith("@s.whatsapp.net")
       ? String(key.replyJid || key.chatJid).split("@")[0].split(":")[0]
       : null;
-    const data = await forwardIncomingToAI({
+    const startedAt = Date.now();
+    let data;
+    try { data = await forwardIncomingToAI({
       business_id: key.businessId,
       connection_id: key.connectionId,
       chat_jid: key.chatJid,
@@ -137,7 +154,8 @@ const inboundPipeline = createPipeline({
       })),
       push_name: pushName || null,
       detected_language: language || null,
-    }, signal);
+    }, signal); } catch (e) { if (!signal?.aborted) watchdog.incident("brain_request_failed", key.businessId); throw e; }
+    finally { watchdog.observe("brain", Date.now() - startedAt); }
     return typeof data?.reply === "string" ? data.reply.trim() : "";
   },
   send: {
@@ -154,12 +172,15 @@ const inboundPipeline = createPipeline({
         throw new Error("WhatsApp session is not connected.");
       }
       const payload = safeTextContent(content);
-      await sendWithRetryCache(st.sock, key.chatJid, payload, messageId);
+      watchdog.sent(key.businessId, messageId);
+      try { await sendWithRetryCache(st.sock, key.chatJid, payload, messageId); }
+      catch (e) { watchdog.incident("send_uncertain", key.businessId); throw e; }
     },
   },
 });
 
 sessionManager = createSessionManager({
+  watchdog,
   supabase,
   logger,
   canConnect: checkWhatsAppAccess,
@@ -220,7 +241,8 @@ async function runSweepOnce() {
   if (sweepInFlight) return; // previous sweep still running; skip this tick
   sweepInFlight = true;
   try {
-    const activity = await inboundPipeline.sweep();
+    const owned = new Set([...sessionManager.sessions].filter(([,st]) => st.status === "connected").map(([id]) => id));
+    const activity = await inboundPipeline.sweep(owned);
     // Live inbound messages use their own local debounce timer, so the DB sweep
     // is recovery-only. When recovery finds nothing, back off instead of
     // polling Supabase every 2 seconds forever. Any due recovery work resets
@@ -342,6 +364,12 @@ async function finishOutboundIdempotency(businessId, idempotencyKey, status, mes
     .eq("idempotency_key", idempotencyKey);
 }
 
+const watchdogTimer = setInterval(() => {
+  watchdog.tick();
+  sessionManager.inspectSessions();
+}, 1000);
+watchdogTimer.unref();
+
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
@@ -366,6 +394,9 @@ function requireBridgeKey(req, res, next) {
 app.get("/", (_req, res) =>
   res.json({ ok: true, service: "G Capital AI WhatsApp Bridge" })
 );
+
+app.get("/healthz", (_req, res) => res.json({ ok: true, watchdog: { intervalMs: 1000, ticks: watchdog.snapshot().ticks }, commit: process.env.RENDER_GIT_COMMIT || null }));
+app.get("/ops/watchdog", requireBridgeKey, (_req,res) => res.json(watchdog.snapshot()));
 
 app.post("/session/:businessId/start", requireBridgeKey, async (req, res) => {
   const { phoneNumber } = req.body || {};
@@ -544,15 +575,20 @@ app.post("/session/:businessId/send-media", requireBridgeKey, async (req, res) =
 
 const httpServer = app.listen(PORT, () => {
   console.log(`G Capital AI WhatsApp Bridge listening on port ${PORT}`);
-  sessionManager.resumeAll().catch((err) =>
-    logger.error({ err }, "resumeAll failed")
-  );
+  const resume = () => sessionManager.resumeAll().catch((err) => {
+    logger.error({ err }, "resumeAll failed"); watchdog.incident("resume_failed");
+    if (!shuttingDown) setTimeout(resume, 30000).unref();
+  });
+  resume();
+  watchdog.incident("watchdog_started");
 });
 
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(watchdogTimer);
+  clearTimeout(sweepTimer);
   logger.warn({ signal }, "bridge shutting down");
   httpServer.close();
   await sessionManager.shutdownAll().catch((err) =>
