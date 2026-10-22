@@ -11,3 +11,11 @@ Alerts: wa-watchdog-alert authenticates the existing bridge secret and logs in a
 Validation: npm ci; npm test. Existing postinstall compatibility patch must run. Tests never send customer messages. Real end-to-end WhatsApp validation requires a message from the owner's test phone and its actual delivery receipt; mocked tests do not prove that path.
 
 Rollback: previous live commit 2aabbbabcce0d2a22610b64b226764027754296e, Render deploy dep-dbckob5g1s2s7385p2tg. Redeploy that exact commit or use Render rollback after confirming current deployment. This change has no schema migration, auth deletion or Brain V2 replacement. The added alert Edge Function may remain dormant after bridge rollback. Avoid overlapping manual deploys. Changes to credentials or infrastructure are not automatic recovery actions.
+
+## Independent synthetic monitor
+
+Supabase cron job 59, gca-whatsapp-watchdog-probe-v1, runs every minute. It invokes the authenticated wa-watchdog-probe function using the existing Vault secret by reference. The probe reads the protected watchdog heartbeat and the 646 session status, logs a safe snapshot to admin_error_log, and emails the fixed owner when unavailable. It does not send WhatsApp messages or invoke Brain V2. Sender delivery to the owner's Gmail inbox was verified on 2026-10-22 at 04:01 UTC. Disable this job only with cron.unschedule as documented in watchdog-cron.sql.
+
+## Deployment validation
+
+Bridge release: 3d528a12adab85eac90d514a15e8de1613e9db1d. Tests: 103 passed, including 100 simulated lease-contention waits that do not consume the recovery budget. Old-deploy ownership waits retain backoff but no longer open the failure circuit. The previous live instance can retain its lease during Render's drain window; this is expected fencing, and must never be bypassed by deleting auth or stealing an unexpired lease. Successful synthetic probes are infrastructure/session checks, not proof of a real customer -> Brain V2 -> delivery transaction. A fresh owner-phone inbound test is still needed for that final validation.
