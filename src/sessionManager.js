@@ -122,7 +122,12 @@ export function createSessionManager({
   async function automaticStart(businessId) {
     const delay = watchdog?.recoveryDelay(businessId) || 0;
     if (delay) { scheduleResumeRetry(businessId, delay); return; }
-    return startSession(businessId);
+    try { return await startSession(businessId); }
+    catch (e) {
+      // Waiting for the previous deploy is not a failed recovery attempt.
+      if (e?.code === "SESSION_OWNED_ELSEWHERE") watchdog?.deferOwnership(businessId);
+      throw e;
+    }
   }
 
   function inspectSessions() {

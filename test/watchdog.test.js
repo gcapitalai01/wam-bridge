@@ -30,3 +30,17 @@ test('alert endpoint uses fixed owner and excludes arbitrary payload and secrets
  const r=await handler(new Request('https://test',{method:'POST',headers:{'x-bridge-secret':'private'},body:JSON.stringify({code:'watchdog_started',to:'attacker@example.com',message:'CUSTOMER_SECRET'})}));
  assert.equal(r.status,200);const mail=JSON.parse(calls.find(c=>c.url.includes('sender.net')).options.body);assert.equal(mail.to.email,'alexusa0110@gmail.com');assert.ok(!JSON.stringify(mail).includes('CUSTOMER_SECRET'));
 });
+
+import { createProbe } from '../ops/wa-watchdog-probe/probe.js';
+test('external synthetic probe reads health and never sends WhatsApp',async()=>{
+ const urls=[];const probe=createProbe(()=> 'secret',()=>{throw Error('no alert expected')},async(url,o)=>{urls.push(url);return Response.json(url.includes('/ops/')?{ticks:50,lastTick:Date.now()}:url.includes('/status')?{status:'connected'}:{});});
+ const r=await probe(new Request('https://probe',{method:'POST',headers:{'x-bridge-secret':'secret'}}));assert.equal(r.status,200);assert.equal(urls.length,3);assert.ok(urls.every(u=>!u.endsWith('/send')));
+});
+test('external probe reports unreachable bridge through independent mail channel',async()=>{
+ let code;const probe=createProbe(()=> 'secret',async req=>{code=(await req.json()).code;return Response.json({ok:true})},async()=>{throw Error('down')});
+ const r=await probe(new Request('https://probe',{method:'POST',headers:{'x-bridge-secret':'secret'}}));assert.equal(r.status,503);assert.equal(code,'bridge_unreachable');
+});
+test('deployment lease contention never exhausts actual recovery budget',()=>{
+ const w=createWatchdog();for(let i=0;i<100;i++){assert.equal(w.recoveryDelay('b'),0);w.deferOwnership('b');}
+ for(let i=0;i<6;i++) assert.equal(w.recoveryDelay('b'),0);assert.ok(w.recoveryDelay('b')>0);
+});

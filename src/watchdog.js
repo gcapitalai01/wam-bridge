@@ -36,6 +36,10 @@ export function createWatchdog({ now = Date.now, alert = async () => {}, maxAtte
     }
     b.attempts.push(t); return 0;
   }
+  function deferOwnership(businessId) {
+    const b = budgets.get(businessId);
+    if (b) b.attempts.pop();
+  }
   function sent(businessId, id) {
     if (!id) return;
     pending.set(`${businessId}:${id}`, { businessId, at: now() });
@@ -58,5 +62,5 @@ export function createWatchdog({ now = Date.now, alert = async () => {}, maxAtte
   function snapshot() {
     return { intervalMs: 1000, ticks, lastTick, alertFailures, queuedAlerts: alertQueue.size, pendingDeliveries: pending.size, counters: { ...counters }, latencyMs: Object.fromEntries(Object.entries(latencies).map(([k,a]) => { const s=[...a].sort((x,y)=>x-y); return [k,{count:s.length,p95:s[Math.ceil(s.length*.95)-1],max:s.at(-1)}]; })) };
   }
-  return { count, observe, incident, recoveryDelay, sent, receipt, tick, snapshot };
+  return { count, observe, incident, recoveryDelay, deferOwnership, sent, receipt, tick, snapshot };
 }
